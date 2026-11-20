@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -286,7 +286,9 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// writer queue per peer.
 struct PeerLinks {
     from: NodeId,
-    peers: Arc<HashMap<NodeId, PeerAddr>>,
+    /// Where each peer is dialled. A peer is added, or moved, while the
+    /// transport runs ([`TcpTransport::set_peer`]).
+    peers: RwLock<HashMap<NodeId, PeerAddr>>,
     /// Per-peer outbound queues (bounded); each backed by a lazily-spawned
     /// writer. Carries pre-encoded frames (`Bytes`), so a broadcast encodes
     /// once and every peer's queue shares the same buffer.
@@ -309,7 +311,7 @@ impl PeerLinks {
         let peers = peers.into_iter().map(|(id, addr)| (id, addr.into()));
         Self {
             from,
-            peers: Arc::new(peers.collect()),
+            peers: RwLock::new(peers.collect()),
             senders: Mutex::new(HashMap::new()),
             tls,
             metrics: Arc::new(Metrics::new()),
@@ -324,11 +326,27 @@ impl PeerLinks {
         if let Some(tx) = senders.get(&to) {
             return Some(tx.clone());
         }
-        let addr = self.peers.get(&to)?.clone();
+        let addr = self.peers.read().expect("peers poisoned").get(&to)?.clone();
         let (tx, rx) = mpsc::channel(self.queue_capacity);
         tokio::spawn(peer_writer(to, addr, rx, self.tls.clone()));
         senders.insert(to, tx.clone());
         Some(tx)
+    }
+
+    /// Dials `to` at `addr` from now on; `true` when that is news. A writer
+    /// on another address ends with its queue (the frames it holds are shed,
+    /// as on any broken link), and the next send dials the new one.
+    fn set_peer(&self, to: NodeId, addr: PeerAddr) -> bool {
+        // Both locks, senders first as in `writer_for`: a send between the
+        // two would spawn a writer on the address being replaced.
+        let mut senders = self.senders.lock().expect("senders poisoned");
+        let mut peers = self.peers.write().expect("peers poisoned");
+        if peers.get(&to) == Some(&addr) {
+            return false;
+        }
+        peers.insert(to, addr);
+        senders.remove(&to);
+        true
     }
 
     /// Enqueues a pre-encoded frame for `to`.
@@ -371,7 +389,9 @@ impl PeerLinks {
     }
 }
 
-/// A framed-TCP [`MessageSink`] over a static membership map, optionally over TLS.
+/// A framed-TCP [`MessageSink`] over a map of where each node is dialled,
+/// optionally over TLS. The map takes a node while the transport runs
+/// ([`set_peer`](TcpTransport::set_peer)).
 pub struct TcpTransport {
     links: PeerLinks,
 }
@@ -424,6 +444,24 @@ impl TcpTransport {
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.links.metrics = metrics;
         self
+    }
+
+    /// Reaches `peer` at `addr` from now on: a node added to the cluster
+    /// since this transport was built, or one that moved. Returns whether
+    /// that is news; a peer already dialled elsewhere is dialled again, at
+    /// `addr`, on the next message to it.
+    pub fn set_peer(&self, peer: NodeId, addr: impl Into<PeerAddr>) -> bool {
+        self.links.set_peer(peer, addr.into())
+    }
+
+    /// Where `peer` is dialled, if this transport knows it.
+    pub fn peer(&self, peer: NodeId) -> Option<PeerAddr> {
+        self.links
+            .peers
+            .read()
+            .expect("peers poisoned")
+            .get(&peer)
+            .cloned()
     }
 
     /// A point-in-time snapshot of this transport's observability counters (only the

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::{RejoinMark, Settings};
-use evento_cluster::keys;
+use evento_cluster::{addresses, keys};
 use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr, Share};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
@@ -145,6 +145,58 @@ async fn open_all(root: &Path, addrs: &[SocketAddr], absent_after_secs: u64) -> 
             .unwrap();
     }
     [a, b, c]
+}
+
+/// The address of a node no settings name is kept in the store: written
+/// through one node, every node dials it there a moment later. The settings
+/// stand for the nodes they name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_the_cluster_keeps_reaches_every_node() {
+    let root = temp_root("addresses");
+    let addrs = free_addrs().await;
+    let nodes = open_all(&root, &addrs, 0).await;
+    assert_eq!(
+        nodes[1].cluster.address(NodeId(0)),
+        Some(PeerAddr::from(addrs[0]))
+    );
+    assert_eq!(nodes[1].cluster.address(NodeId(7)), None);
+
+    let first: PeerAddr = "node-7.cluster.internal:7000".parse().unwrap();
+    assert!(addresses::record(&nodes[0].executor, NodeId(7), &first)
+        .await
+        .unwrap());
+    assert!(
+        !addresses::record(&nodes[2].executor, NodeId(7), &first)
+            .await
+            .unwrap(),
+        "said already"
+    );
+    for node in &nodes {
+        eventually(
+            "every node dials the node where the cluster says",
+            || async { node.cluster.address(NodeId(7)) == Some(first.clone()) },
+        )
+        .await;
+    }
+
+    // The node moved: the last address said stands.
+    let moved: PeerAddr = "10.1.2.3:7000".parse().unwrap();
+    assert!(addresses::record(&nodes[1].executor, NodeId(7), &moved)
+        .await
+        .unwrap());
+    // One the settings name stays where they say.
+    assert!(addresses::record(&nodes[1].executor, NodeId(0), &moved)
+        .await
+        .unwrap());
+    for node in &nodes {
+        eventually("every node dials the node where it moved", || async {
+            node.cluster.address(NodeId(7)) == Some(moved.clone())
+        })
+        .await;
+        assert_ne!(node.cluster.address(NodeId(0)), Some(moved.clone()));
+    }
+    let known = addresses::known(&nodes[2].executor).await.unwrap();
+    assert_eq!(known.get(&NodeId(7)), Some(&moved));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

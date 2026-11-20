@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use evento_core::Evento;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -49,10 +50,14 @@ use crate::node::{LostJournal, Node, NodeConfig, PartialSnapshot};
 use crate::share::Share;
 use crate::tcp::{serve, PeerAddr, TcpTransport};
 use crate::transport::{Envelope, InMemoryNetwork};
-use crate::{DataStore, DynamicTopology, Journal, MessageSink, Topology};
+use crate::{addresses, DataStore, DynamicTopology, Journal, MessageSink, Topology};
 
 /// Frames waiting for the node's inbox loop, from the TCP listener.
 const INBOX_FRAMES: usize = 1024;
+
+/// How often a node reads where the nodes added since it started are
+/// reached ([`addresses`]).
+const ADDRESS_LOOK: Duration = Duration::from_secs(1);
 
 /// The `[cluster]` section of a deployment's configuration: the nodes the
 /// cluster is founded with, where they are reached, and the few knobs an
@@ -651,6 +656,8 @@ impl<E: ClusterBackend> Builder<E> {
         }
 
         let mut tasks = Vec::new();
+        let named = peers.len();
+        let mut transport = None;
         let (sink, inbox): (Arc<dyn MessageSink>, mpsc::Receiver<Envelope>) = match listener {
             None => {
                 let net = InMemoryNetwork::new();
@@ -660,7 +667,9 @@ impl<E: ClusterBackend> Builder<E> {
             Some(listener) => {
                 let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_FRAMES);
                 tasks.push(serve(listener, inbox_tx));
-                (Arc::new(TcpTransport::new(id, peers)), inbox_rx)
+                let tcp = Arc::new(TcpTransport::new(id, peers));
+                transport = Some(tcp.clone());
+                (tcp, inbox_rx)
             }
         };
         // The members are what the cluster agreed on, which the journal
@@ -765,9 +774,18 @@ impl<E: ClusterBackend> Builder<E> {
         ));
 
         let executor = ClusterExecutor::new(node.clone(), store);
+        if let Some(transport) = &transport {
+            tasks.push(follow_addresses(
+                Evento::new(executor.clone()),
+                transport.clone(),
+                id,
+                named,
+            ));
+        }
         let cluster = Arc::new(Cluster {
             node,
             topology,
+            transport,
             tasks: Mutex::new(tasks),
             joined: mark.is_some(),
             founded: found,
@@ -795,6 +813,8 @@ pub struct Cluster {
     node: Node,
     /// The layouts the cluster agreed on, as this node installed them.
     topology: Arc<dyn Topology>,
+    /// The links to the other nodes; `None` for a node alone, in memory.
+    transport: Option<Arc<TcpTransport>>,
     /// The inbox loop, the recovery sweep, the listener and the signal watch.
     tasks: Mutex<Vec<JoinHandle<()>>>,
     joined: bool,
@@ -865,6 +885,14 @@ impl Cluster {
             epoch: layout.epoch(),
             nodes: layout.nodes(),
         }
+    }
+
+    /// Where this node dials `node`: its entry in [`Settings::peers`], or,
+    /// for a node the settings do not name, the address the cluster keeps
+    /// for it ([`addresses`]), read a moment after it is written. `None`
+    /// for a node this one cannot reach, and on a node alone, in memory.
+    pub fn address(&self, node: NodeId) -> Option<PeerAddr> {
+        self.transport.as_ref()?.peer(node)
     }
 
     /// Waits, up to `limit`, until this node takes part: a node opened over
@@ -1084,6 +1112,44 @@ async fn join_through(node: &Node, contacts: &[NodeId]) -> anyhow::Result<()> {
         }
     }
     outcome
+}
+
+/// Keeps the links in line with where the cluster says its nodes are
+/// reached ([`addresses`]): a node added since this one started is in no
+/// settings of its own. The settings stand for the `named` nodes they
+/// name, which an operator moves by restarting this node onto another
+/// address.
+fn follow_addresses(
+    executor: Evento,
+    transport: Arc<TcpTransport>,
+    me: NodeId,
+    named: usize,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut failed = false;
+        loop {
+            match addresses::known(&executor).await {
+                Ok(known) => {
+                    failed = false;
+                    for (node, addr) in known {
+                        if node == me || (node.0 as usize) < named {
+                            continue;
+                        }
+                        if transport.set_peer(node, addr.clone()) {
+                            tracing::info!(node = node.0, %addr, "a node is reached at an address the cluster keeps");
+                        }
+                    }
+                }
+                // Once per run of failures: the store is read again shortly.
+                Err(err) if !failed => {
+                    failed = true;
+                    tracing::warn!(%err, "cannot read where the nodes are reached");
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(ADDRESS_LOOK).await;
+        }
+    })
 }
 
 /// Marks the store for a copy when the node is told to rejoin, or its
