@@ -243,7 +243,7 @@ timeouts for geo/WAN** deployments.
 | `compaction_margin` | 1 s | Lag on the redundancy watermark, and the original coordinator's **deadline**: a node never votes for a coordinator's PreAccept, or its Accept at the transaction's own ballot, for a transaction it never witnessed whose `t0` is older than its clock less this margin (`votes_late`), and tells the coordinator so, which settles the write at once — recovered, and invalidated unless enough replicas hold it after all (`Invalidated`: nothing was written, `writes_invalidated`). `ClusterExecutor` writes it again as a fresh transaction, up to three attempts in all, and answers `WriteError::Unavailable` with the `Invalidated` cause only when the last is invalidated too (#521). A node's own replica is never late for a write the node is still coordinating: alone in its group, its inbox is the message delay, and its vouches never pass a write it coordinates (#466). A recovery past the deadline asks such a node twice: first, it answers that it is late; then the recovery asks it to refuse the transaction for good, when that proves it never committed — one only a minority holds, which the recovery then invalidates — or to vote, when the replies show it may have committed (a replica that accepted it lost its journal, §7). It votes unless the transaction is below its **vote fence**, what it vouched for (§5, `votes_fenced`), so one a slow quorum of its shard held unapplied all along is still decided, however late (#337). A multi-shard transaction a shard never saw is invalidated only past the deadline too, where that shard's replicas can be refused for good (#377): within it they only promise the ballot and wait to be handed its part. Keep it ≥ `recovery_timeout` + 2 × the clock-skew bound + worst-case message delay, so a coordinator's messages and a recovery of a transaction still in flight land inside it. |
 | `max_journal_batch` | 128 | Messages drained per group-commit fsync (latency vs. fsync amortization). The applies a batch decides run on the node's applier task, not in the batch: no reply waits for a write to the data store (#475). |
 | `max_apply_batch` | 128 | Decided transactions the applier enacts in one write to the data store: the ones ready together share the store's fsync (#530). `1` applies one at a time. |
-| `lazy_flush` | 50 ms | How long journal records nothing waits on may stay staged. A batch that leaves nothing to send (a node's own coordination past its vote) is not flushed at once; its records ride the next flush something waits on, or one within this delay. A crash meanwhile loses them as it loses a batch before its flush: the node recovers those transactions from its votes at the restart. `0` flushes every batch. |
+| `lazy_flush` | 50 ms | How long journal records nothing waits on may stay staged. A batch that leaves nothing to send that waits on the journal (every batch of a write past its vote, on its coordinator since #530 and on the other replicas since #561) is not flushed at once; its records ride the next flush something waits on, or one within this delay. A crash meanwhile loses them as it loses a batch before its flush: the node recovers those transactions from its votes at the restart. `0` flushes every batch. |
 | `phi_threshold` | 8.0 | Phi-accrual suspicion level; higher tolerates more latency variance before suspecting a coordinator. |
 | `acceptable_pause` | 500 ms | How long a live peer may go quiet beyond its usual heartbeat interval (scheduler stall, slow fsync, loaded host) before suspicion starts to rise. |
 | `linearizable_reads` | false | Opt-in linearizable reads (§9) — one consensus round per read. |
@@ -841,9 +841,15 @@ through `ClusterExecutor`) — split it into several writes.
   flush **fails** (disk error/full disk) the node *withholds* that batch's acks — it
   never claims durability it doesn't have — so a node that can't fsync stops acking
   (treat a node logging `journal flush failed` as failed; investigate its disk).
-- **Write latency is the journal's:** every step of a write on a replica — its
-  vote, its promise to a recovery, its commit — is staged and **flushed** (one
-  fsync) before the reply leaves, and the sweep adds a flush per
+- **Write latency is the journal's:** what a replica answers for with its
+  journal — its vote, its accept, its promise to a recovery — is staged and
+  **flushed** (one fsync) before the reply leaves. Its answer to a commit and
+  its acknowledgement of an apply are not held for a flush (#561): the commit
+  is what a quorum of durable votes already determines, and the
+  acknowledgement says the store took the write, which it did. Their records
+  ride the next flush, or the lazy flusher's (`lazy_flush`). So a write costs
+  a replica two syncs it waits on, its vote's and the store's, where it cost
+  four. The sweep adds a flush per
   `recovery_interval` (the vote fence its report rests on) and a clock-bound save
   about every two clock skews (§3). On SQLite one writer connection carries all of
   it, and the store's applies. A disk whose fsync stalls stalls every write with

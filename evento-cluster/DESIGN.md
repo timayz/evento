@@ -829,7 +829,32 @@ backend (sql/fjall). Phases, in order:
   the writes of concurrent writers share the store's fsync as they share the
   journal's; a batch the store refuses (a re-apply, a store behind) is applied
   one at a time. On a Turso file store a node alone went from 4.2 to 2.2 fsyncs
-  per write with one writer, and from 3.1 to 0.24 with twenty. **The vote's fsync
+  per write with one writer, and from 3.1 to 0.24 with twenty. ✅ **No reply
+  held for a record nothing reads (#561):** on a replica that does not
+  coordinate it a write still cost four syncs, one behind the other — its
+  vote, its commit before `ReadOk`, the store's, its applied record before
+  `Applied` — and on a disk whose syncs stall each queued behind the batch
+  before it (#558). What each guards: the *vote* is what the decision is
+  recovered from, and the first durable record of the events; it stays. The
+  *commit* record guards nothing its `ReadOk` tells: a quorum of durable
+  votes already determines the commit, a replica that forgets it is one the
+  `Commit` never reached (recovered, or handed it by anti-entropy), and the
+  read result was never durable — a restart reads again, and reads the same
+  (`Replica::restore`; its own events found in the store count as held,
+  #309). The *store's* sync is the apply; it stays. The *applied* record
+  guards the watermark report (#331), which flushes before it leaves
+  (`vouch_durably`); `Applied` itself says the store took the write. So
+  `ReadOk` and `Applied` leave without the flush (`Node::waits_for_flush`), as
+  the node's own always did (#475), and their records ride the next flush or
+  the lazy flusher's: two syncs a replica's reply waits on, not four. Checked
+  where a crash loses what was staged and not flushed (`FaultJournal`): the
+  restart scenarios over failing storage on the three stores, the swarm, the
+  reshard swarm. Three Turso nodes on one NVMe, four writers at 5 writes a
+  second each: 2.67 → 2.07 syncs of the log per write per node (the sweep's
+  ten flushes a second included), p50 49 → 31 ms. The applied record in the
+  store's own transaction, for a backend that holds both, was left out: once
+  no reply waits on that record it would save the lazy flush alone, for a
+  `DataStore` that takes journal records. **The vote's fsync
 stays, on a node alone too (#537):** its vote is the whole quorum and nobody else
 could decide otherwise, but the vote is also the first durable record that carries
 the write's events, and the journal, not the store, is what an acknowledged write
