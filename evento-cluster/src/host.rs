@@ -423,6 +423,13 @@ pub struct PeerState {
     /// How long since it was last heard from (since this node opened, if
     /// never).
     pub silent_for: Duration,
+    /// Whether this node holds a connection to it: its own messages get
+    /// through, where [`silent_for`](Self::silent_for) says the peer's do.
+    /// After a partition a node hears its peers a moment before it reaches
+    /// them, as they dial it while it dials them; one ready for requests
+    /// hears and reaches a majority. Always `true` over the in-memory
+    /// transport.
+    pub reached: bool,
     /// Whether this node stopped waiting for it ([`Settings::absent_after_secs`]).
     pub given_up: bool,
     /// What it last said about itself ([`Builder::label`]), if anything was
@@ -1451,6 +1458,10 @@ impl Cluster {
                 .map(|id| PeerState {
                     id,
                     silent_for: self.node.silent_for(id),
+                    reached: self
+                        .transport
+                        .as_ref()
+                        .is_none_or(|transport| transport.reaches(id)),
                     given_up: absent.contains(&id),
                     label: self.node.peer_label(id).map(|label| label.to_string()),
                     keys: self.node.peer_serves(id).map(|keys| keys.to_vec()),

@@ -4,6 +4,10 @@
 //! redialled; a peer that was unreachable is dialled again within its backoff
 //! once it comes up. Before, a stalled peer pinned its writer — and shed every
 //! frame meant for it — for minutes, even after the network healed.
+//!
+//! A frame queued while its peer is dialled waits for the connection a
+//! moment, and is sent when it is up without another frame to prompt the
+//! redial; one that waited too long is dropped (#603).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -145,5 +149,67 @@ async fn a_refused_peer_is_reached_once_it_comes_up() {
             break;
         }
     }
+    peer.abort();
+}
+
+/// Reads every connection to `listener`, reporting each frame's length.
+fn reading_peer(
+    listener: TcpListener,
+    frames: mpsc::UnboundedSender<usize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+                while let Some(Ok(bytes)) = framed.next().await {
+                    let _ = frames.send(bytes.len());
+                }
+            });
+        }
+    })
+}
+
+/// What a node just back from a partition does: it asks once, into a link
+/// that comes up a moment later, and asks nothing more while it waits for the
+/// answer. The question must leave when the link is up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_queued_while_the_peer_is_dialled_is_sent_once_it_is_reached() {
+    let addr = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let transport = TcpTransport::new(NodeId(0), HashMap::from([(NodeId(1), addr)]));
+
+    // Refused dials, so the backoff has grown to its cap.
+    for n in 0..12 {
+        transport.send(NodeId(1), applied(n)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!transport.reaches(NodeId(1)));
+    // Nothing queued is fresh any more when the one frame that matters is.
+    tokio::time::sleep(evento_cluster::tcp::FRAME_HOLD).await;
+    transport.send(NodeId(1), bulky(1000)).await.unwrap();
+
+    // The peer comes up, and the transport is given nothing more to send.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let (frames_tx, mut frames) = mpsc::unbounded_channel();
+    let peer = reading_peer(listener, frames_tx);
+
+    let len = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+        .await
+        .expect("the frame queued before the peer came up reaches it")
+        .unwrap();
+    // An `Applied` is a few dozen bytes.
+    assert!(len > 200, "the frame that waited, not an older one: {len}");
+    assert!(transport.reaches(NodeId(1)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), frames.recv())
+            .await
+            .is_err(),
+        "the frames that waited too long were dropped"
+    );
     peer.abort();
 }

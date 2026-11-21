@@ -4,8 +4,10 @@
 //! Each frame is a bitcode-serialised `Frame` (sender id + [`Message`]) over a
 //! [`LengthDelimitedCodec`] stream. Outbound delivery is per-peer and lazy: the
 //! first message to a peer spawns a writer task that connects on demand and
-//! reconnects after a drop. Delivery is best-effort and unacknowledged — exactly
-//! what the consensus layer assumes, since quorums and recovery tolerate loss.
+//! reconnects after a drop. A frame for a peer whose connection is being
+//! dialled waits a moment for it ([`FRAME_HOLD`]) before it is dropped.
+//! Delivery is best-effort and unacknowledged — exactly what the consensus
+//! layer assumes, since quorums and recovery tolerate loss.
 //!
 //! Membership is static: construct a [`TcpTransport`] with a fixed
 //! `NodeId → PeerAddr` map. A peer is an address or a `host:port` name
@@ -21,8 +23,9 @@
 //! stay available for trusted networks; the framing and consensus layers are
 //! identical either way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -273,14 +276,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// First wait before redialling a peer that could not be reached; doubles per
-/// failed dial up to [`RECONNECT_BACKOFF_MAX`], and resets on a connect. Batches
-/// queued meanwhile are dropped without dialling, so a dead peer costs one
-/// dial per backoff instead of one per batch.
+/// failed dial up to [`RECONNECT_BACKOFF_MAX`], and resets on a connect. Frames
+/// queued meanwhile wait for the redial ([`FRAME_HOLD`]), so a dead peer costs
+/// one dial per backoff instead of one per batch.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(100);
 
 /// Cap on the redial backoff: small, so a restarted peer is reached again
 /// within about a second.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// How long a frame waits for its peer's connection, from when it was queued:
+/// one capped backoff and a dial. A node just back from a partition asks its
+/// first round into links that come up a few hundred milliseconds later; sent
+/// then, the round is answered, where dropped it ran out its timeout with
+/// every peer reachable (#603). Past this the frame is dropped: its round has
+/// given up or is about to, and a peer that stays away is not owed a backlog.
+pub const FRAME_HOLD: Duration = Duration::from_secs(2);
+
+/// A frame in a peer's outbound queue, and when it was put there.
+struct Queued {
+    at: Instant,
+    bytes: Bytes,
+}
+
+/// A peer's outbound queue, and whether its writer holds a connection.
+#[derive(Clone)]
+struct Link {
+    tx: mpsc::Sender<Queued>,
+    up: Arc<AtomicBool>,
+}
 
 /// The outbound side of a [`TcpTransport`]: one lazily-connected, bounded
 /// writer queue per peer.
@@ -292,7 +316,7 @@ struct PeerLinks {
     /// Per-peer outbound queues (bounded); each backed by a lazily-spawned
     /// writer. Carries pre-encoded frames (`Bytes`), so a broadcast encodes
     /// once and every peer's queue shares the same buffer.
-    senders: Mutex<HashMap<NodeId, mpsc::Sender<Bytes>>>,
+    senders: Mutex<HashMap<NodeId, Link>>,
     /// Client TLS settings; `None` for plaintext.
     tls: Option<TlsClient>,
     /// Observability counters; bumps `messages_shed` when a full peer queue drops a
@@ -321,16 +345,26 @@ impl PeerLinks {
 
     /// The outbound queue for `to`, spawning its writer task on first use.
     /// `None` if `to` is not a known peer.
-    fn writer_for(&self, to: NodeId) -> Option<mpsc::Sender<Bytes>> {
+    fn writer_for(&self, to: NodeId) -> Option<mpsc::Sender<Queued>> {
         let mut senders = self.senders.lock().expect("senders poisoned");
-        if let Some(tx) = senders.get(&to) {
-            return Some(tx.clone());
+        if let Some(link) = senders.get(&to) {
+            return Some(link.tx.clone());
         }
         let addr = self.peers.read().expect("peers poisoned").get(&to)?.clone();
         let (tx, rx) = mpsc::channel(self.queue_capacity);
-        tokio::spawn(peer_writer(to, addr, rx, self.tls.clone()));
-        senders.insert(to, tx.clone());
+        let up = Arc::new(AtomicBool::new(false));
+        tokio::spawn(peer_writer(to, addr, rx, self.tls.clone(), up.clone()));
+        senders.insert(to, Link { tx: tx.clone(), up });
         Some(tx)
+    }
+
+    /// Whether the writer for `to` holds a connection.
+    fn reaches(&self, to: NodeId) -> bool {
+        self.senders
+            .lock()
+            .expect("senders poisoned")
+            .get(&to)
+            .is_some_and(|link| link.up.load(Ordering::Relaxed))
     }
 
     /// Dials `to` at `addr` from now on; `true` when that is news. A writer
@@ -368,7 +402,11 @@ impl PeerLinks {
             return;
         }
         if let Some(tx) = self.writer_for(to) {
-            match tx.try_send(bytes) {
+            let queued = Queued {
+                at: Instant::now(),
+                bytes,
+            };
+            match tx.try_send(queued) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.metrics.record_shed();
@@ -464,6 +502,16 @@ impl TcpTransport {
             .cloned()
     }
 
+    /// Whether this transport holds a connection to `peer`: its own frames
+    /// get through, as far as it can tell. `false` for a peer it never sent
+    /// to, and while a peer is being dialled — which, after a partition, is
+    /// a moment longer than it takes to hear from the peer again, as the
+    /// peer dials too. A connection whose peer went silent still counts
+    /// until a write on it fails or stalls.
+    pub fn reaches(&self, peer: NodeId) -> bool {
+        self.links.reaches(peer)
+    }
+
     /// A point-in-time snapshot of this transport's observability counters (only the
     /// shed count is transport-driven; the rest come from a shared node, if any).
     pub fn metrics(&self) -> MetricsSnapshot {
@@ -557,9 +605,13 @@ async fn dial(
 /// cause is a stale connection to a peer that restarted, where the first write
 /// after the restart fails. Without the retry that frame was dropped and only
 /// the *next* one reconnected — on a multiplexed transport one connection
-/// carries every group, so one stale connection cost every tenant a frame. A
-/// batch whose peer cannot be reached at all (connect fails) is dropped; loss is
-/// tolerated by quorums and recovery.
+/// carries every group, so one stale connection cost every tenant a frame.
+///
+/// A frame whose peer cannot be reached **waits for the redial**, up to
+/// [`FRAME_HOLD`] from when it was queued, and the redial comes when the
+/// backoff elapses, not with the next frame: what was asked a moment before
+/// the peer came back is asked once it is. A frame that waited longer is
+/// dropped; loss is tolerated by quorums and recovery.
 ///
 /// A peer named by host is resolved at each dial, so the redial after a
 /// failure finds a peer that came back at another address; a name that does
@@ -574,73 +626,119 @@ async fn dial(
 async fn peer_writer(
     to: NodeId,
     addr: PeerAddr,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<Queued>,
     tls: Option<TlsClient>,
+    up: Arc<AtomicBool>,
 ) {
     let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
     let mut backoff = RECONNECT_BACKOFF_MIN;
-    // While set and in the future, batches are dropped without dialling.
+    // While set and in the future, the peer is not dialled.
     let mut retry_at: Option<Instant> = None;
-    // Logged on the transition only, not once per dropped batch.
+    // Logged on the transition only, not once per dropped frame.
     let mut unreachable = false;
-    while let Some(first) = rx.recv().await {
-        // Coalesce this frame with everything already queued.
-        let mut batch = vec![first];
-        while let Ok(bytes) = rx.try_recv() {
-            batch.push(bytes);
-        }
-        for attempt in 0..2 {
-            if conn.is_none() {
-                if retry_at.is_some_and(|at| Instant::now() < at) {
-                    // Still backing off: drop the batch, dial on a later one.
-                    break;
-                }
-                let Some(stream) = connect(to, &addr, &tls).await else {
-                    // Unreachable right now: drop the batch, redial after the
-                    // backoff.
-                    retry_at = Some(Instant::now() + backoff);
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                    if !unreachable {
-                        unreachable = true;
-                        tracing::warn!(peer = to.0, %addr, "peer unreachable; dropping its frames");
-                    }
-                    break;
-                };
-                conn = Some(Framed::new(stream, codec()));
-                backoff = RECONNECT_BACKOFF_MIN;
-                retry_at = None;
-                if unreachable {
-                    unreachable = false;
-                    tracing::info!(peer = to.0, %addr, "peer reachable again");
-                }
+    // Frames taken off the queue and not written yet, oldest first.
+    let mut held: VecDeque<Queued> = VecDeque::new();
+    // Whether what is held failed a write already.
+    let mut resending = false;
+    loop {
+        if held.is_empty() {
+            resending = false;
+            match rx.recv().await {
+                Some(frame) => held.push_back(frame),
+                None => return,
             }
-            let framed = conn.as_mut().expect("connected above");
-            let err = match tokio::time::timeout(WRITE_TIMEOUT, write_batch(framed, &batch)).await {
-                Ok(Ok(())) => break,
-                Ok(Err(err)) => err,
-                Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"),
+        }
+        // Coalesce with everything already queued.
+        while let Ok(frame) = rx.try_recv() {
+            held.push_back(frame);
+        }
+        if conn.is_none() {
+            if let Some(at) = retry_at.filter(|at| Instant::now() < *at) {
+                // Still backing off: keep what is fresh, and take what comes,
+                // until the redial.
+                tokio::select! {
+                    _ = tokio::time::sleep_until(at.into()) => {}
+                    frame = rx.recv() => match frame {
+                        Some(frame) => held.push_back(frame),
+                        None => return,
+                    },
+                }
+                drop_stale(&mut held);
+                continue;
+            }
+            let Some(stream) = connect(to, &addr, &tls).await else {
+                // Unreachable right now: redial after the backoff, with what
+                // is still fresh then.
+                retry_at = Some(Instant::now() + backoff);
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                if !unreachable {
+                    unreachable = true;
+                    tracing::warn!(
+                        peer = to.0,
+                        %addr,
+                        hold_ms = FRAME_HOLD.as_millis() as u64,
+                        "peer unreachable; its frames wait for a redial, then are dropped"
+                    );
+                }
+                drop_stale(&mut held);
+                continue;
             };
-            // Stale, broken or stalled connection: reconnect and resend once.
-            conn = None;
-            if attempt == 1 {
-                tracing::warn!(
-                    peer = to.0,
-                    frames = batch.len(),
-                    %err,
-                    "write failed again after reconnecting; dropping the batch"
-                );
+            conn = Some(Framed::new(stream, codec()));
+            up.store(true, Ordering::Relaxed);
+            backoff = RECONNECT_BACKOFF_MIN;
+            retry_at = None;
+            if unreachable {
+                unreachable = false;
+                tracing::info!(peer = to.0, %addr, "peer reachable again");
+            }
+            drop_stale(&mut held);
+            if held.is_empty() {
+                continue;
             }
         }
+        let framed = conn.as_mut().expect("connected above");
+        let err = match tokio::time::timeout(WRITE_TIMEOUT, write_batch(framed, &held)).await {
+            Ok(Ok(())) => {
+                held.clear();
+                continue;
+            }
+            Ok(Err(err)) => err,
+            Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"),
+        };
+        // Stale, broken or stalled connection: reconnect and resend once.
+        conn = None;
+        up.store(false, Ordering::Relaxed);
+        if resending {
+            tracing::warn!(
+                peer = to.0,
+                frames = held.len(),
+                %err,
+                "write failed again after reconnecting; dropping the batch"
+            );
+            held.clear();
+        }
+        resending = !resending;
+    }
+}
+
+/// Drops the frames that waited for a connection longer than [`FRAME_HOLD`],
+/// and the oldest past a queue's worth.
+fn drop_stale(held: &mut VecDeque<Queued>) {
+    let now = Instant::now();
+    while held.front().is_some_and(|frame| {
+        held.len() > CHANNEL_CAPACITY || now.saturating_duration_since(frame.at) > FRAME_HOLD
+    }) {
+        held.pop_front();
     }
 }
 
 /// Feeds every frame of `batch`, then flushes once.
 async fn write_batch(
     framed: &mut Framed<ClientStream, LengthDelimitedCodec>,
-    batch: &[Bytes],
+    batch: &VecDeque<Queued>,
 ) -> std::io::Result<()> {
-    for bytes in batch {
-        framed.feed(bytes.clone()).await?;
+    for frame in batch {
+        framed.feed(frame.bytes.clone()).await?;
     }
     // `LengthDelimitedCodec` encodes both `Bytes` and `&[u8]` (tokio-util 0.7.20+),
     // so `Framed` is a `Sink` for two item types; name the one we feed.
