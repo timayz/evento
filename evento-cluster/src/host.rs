@@ -50,7 +50,8 @@ use crate::clock::{HybridLogicalClock, NodeId};
 use crate::executor::{ClusterExecutor, ExecutorDataStore};
 use crate::node::{LostJournal, Node, NodeConfig, NotAMember, PartialSnapshot};
 use crate::share::Share;
-use crate::tcp::{serve, PeerAddr, TcpTransport};
+use crate::tcp::{serve, serve_tls_named, PeerAddr, TcpTransport};
+use crate::tls::{LinkRefusal, NodeTls, TlsSettings};
 use crate::transport::{Envelope, InMemoryNetwork};
 use crate::{addresses, DataStore, DynamicTopology, Journal, MessageSink, Topology};
 
@@ -60,6 +61,10 @@ const INBOX_FRAMES: usize = 1024;
 /// How often a node reads where the nodes added since it started are
 /// reached ([`addresses`]).
 const ADDRESS_LOOK: Duration = Duration::from_secs(1);
+
+/// How often a node reads its certificate's files again, for one renewed
+/// in place ([`NodeTls::reload`]).
+const CERTIFICATE_LOOK: Duration = Duration::from_secs(5);
 
 /// How long a node new to the cluster waits before it asks again whether a
 /// member added it, and how often it says in the log that it waits.
@@ -111,6 +116,18 @@ const CHANGE_ATTEMPTS: usize = 4;
 /// peers = ["app-0.app:7000", "app-1.app:7000", "app-2.app:7000"]
 /// listen = "0.0.0.0:7000"
 /// ```
+///
+/// Between nodes that talk over a network not their own, a `tls` section
+/// encrypts the consensus traffic and lets in the nodes the deployment's
+/// authority issued a certificate to, and no one else ([`TlsSettings`]).
+/// Every node's certificate names it as `peers` does, by host or by address:
+///
+/// ```toml
+/// [cluster.tls]
+/// ca = "/etc/cluster/tls/ca.crt"
+/// cert = "/etc/cluster/tls/tls.crt"
+/// key = "/etc/cluster/tls/tls.key"
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// This node's index into `peers`.
@@ -161,6 +178,19 @@ pub struct Settings {
     /// [`ClusterExecutor::linearizable_reads`].
     #[serde(default)]
     pub linearizable_reads: Option<bool>,
+    /// Mutual TLS between the nodes: this node's certificate and key, and
+    /// the authority every node's certificate is issued by. Unset, the
+    /// nodes talk in clear, for a network that is theirs alone. Set on
+    /// every node or on none: a node with it and one without do not hear
+    /// each other, and each says so ([`PeerState::refused`]).
+    ///
+    /// A node is let in as the node its certificate names: the host, or the
+    /// address, its entry in `peers` gives (for a node added since, the
+    /// address it was added with). The files are read again every few
+    /// seconds, so a certificate is renewed by replacing them, on that node
+    /// alone. See [`tls`](crate::tls).
+    #[serde(default)]
+    pub tls: Option<TlsSettings>,
 }
 
 fn default_absent_after_secs() -> u64 {
@@ -183,6 +213,7 @@ impl Settings {
             absent_after_secs: default_absent_after_secs(),
             write_backlog: default_write_backlog(),
             linearizable_reads: None,
+            tls: None,
         }
     }
 
@@ -430,6 +461,13 @@ pub struct PeerState {
     /// hears and reaches a majority. Always `true` over the in-memory
     /// transport.
     pub reached: bool,
+    /// Why the link with it is down while it answers, over TLS
+    /// ([`Settings::tls`]): a certificate this node does not accept, or its
+    /// own that the peer does not. A file to look at, on this node when
+    /// every peer refuses it ([`LinkRefusal::OwnCertificate`]), where
+    /// [`reached`](Self::reached) and [`silent_for`](Self::silent_for) alone
+    /// read as a node that is away. `None` in clear and in memory.
+    pub refused: Option<LinkRefusal>,
     /// Whether this node stopped waiting for it ([`Settings::absent_after_secs`]).
     pub given_up: bool,
     /// What it last said about itself ([`Builder::label`]), if anything was
@@ -575,6 +613,7 @@ pub struct Builder<E: ClusterBackend> {
     serves_no_key: bool,
     journal: Option<Arc<dyn Journal>>,
     before_copy: Option<Hook>,
+    tls: Option<NodeTls>,
 }
 
 impl<E: ClusterBackend> Builder<E> {
@@ -644,6 +683,16 @@ impl<E: ClusterBackend> Builder<E> {
         self
     }
 
+    /// Mutual TLS between the nodes, from a certificate the application
+    /// holds, in place of the files [`Settings::tls`] names: one read from a
+    /// secret store, say ([`NodeTls::from_pem`], renewed with
+    /// [`NodeTls::replace`] on a clone). Needs [`settings`](Self::settings):
+    /// a node alone, in memory, dials no one.
+    pub fn tls(mut self, tls: NodeTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Runs once the store was emptied for a copy and before the copy
     /// begins: for what the application derives from the events and keeps
     /// next to them (read models in the same database), which the
@@ -675,6 +724,7 @@ impl<E: ClusterBackend> Builder<E> {
             serves_no_key,
             journal,
             before_copy,
+            tls,
         } = self;
         let mut keys: Vec<Option<String>> = match serves {
             Some(keys) => keys.into_iter().map(Some).collect(),
@@ -686,6 +736,18 @@ impl<E: ClusterBackend> Builder<E> {
         if let Some(settings) = &settings {
             settings.validate()?;
         }
+        // Read before anything is bound or opened: a wrong file ends the
+        // open here.
+        let tls = match (tls, &settings) {
+            (Some(_), None) => anyhow::bail!(
+                "TLS is between the nodes of a cluster: a node opened without settings talks to itself in memory"
+            ),
+            (Some(tls), Some(_)) => Some(tls),
+            (None, Some(Settings { tls: Some(files), .. })) => Some(
+                NodeTls::from_files(files).context("cannot read the node's certificate (`cluster.tls`)")?,
+            ),
+            (None, _) => None,
+        };
         let (id, ids, founders, peers, listener) = match &settings {
             None => {
                 tracing::info!("single node");
@@ -709,7 +771,13 @@ impl<E: ClusterBackend> Builder<E> {
                 let listener = tokio::net::TcpListener::bind(listen)
                     .await
                     .with_context(|| format!("cannot bind the consensus listener on {listen}"))?;
-                tracing::info!(node = id.0, %listen, nodes = ids.len(), "cluster node");
+                tracing::info!(
+                    node = id.0,
+                    %listen,
+                    nodes = ids.len(),
+                    tls = tls.is_some(),
+                    "cluster node"
+                );
                 (id, ids, settings.founder_ids(), peers, Some(listener))
             }
         };
@@ -872,8 +940,23 @@ impl<E: ClusterBackend> Builder<E> {
             }
             Some(listener) => {
                 let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_FRAMES);
-                tasks.push(serve(listener, inbox_tx));
-                let tcp = Arc::new(TcpTransport::new(id, peers));
+                let tcp = match tls {
+                    None => {
+                        tasks.push(serve(listener, inbox_tx));
+                        Arc::new(TcpTransport::new(id, peers))
+                    }
+                    Some(tls) => {
+                        let tcp = Arc::new(TcpTransport::with_tls_named(id, peers, tls.clone()));
+                        tasks.push(serve_tls_named(
+                            listener,
+                            inbox_tx,
+                            tls.clone(),
+                            tcp.clone(),
+                        ));
+                        tasks.push(follow_certificate(tls));
+                        tcp
+                    }
+                };
                 transport = Some(tcp.clone());
                 (tcp, inbox_rx)
             }
@@ -1077,6 +1160,7 @@ impl Cluster {
             serves_no_key: false,
             journal: None,
             before_copy: None,
+            tls: None,
         }
     }
 
@@ -1462,6 +1546,10 @@ impl Cluster {
                         .transport
                         .as_ref()
                         .is_none_or(|transport| transport.reaches(id)),
+                    refused: self
+                        .transport
+                        .as_ref()
+                        .and_then(|transport| transport.refusal(id)),
                     given_up: absent.contains(&id),
                     label: self.node.peer_label(id).map(|label| label.to_string()),
                     keys: self.node.peer_serves(id).map(|keys| keys.to_vec()),
@@ -1702,6 +1790,37 @@ fn follow_addresses(
                 Err(_) => {}
             }
             tokio::time::sleep(ADDRESS_LOOK).await;
+        }
+    })
+}
+
+/// Reads the node's certificate again every [`CERTIFICATE_LOOK`], so one
+/// renewed in place is presented without a restart. Files that cannot be
+/// used leave the node on the certificate it has, and are said once.
+fn follow_certificate(tls: NodeTls) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut failed = false;
+        loop {
+            tokio::time::sleep(CERTIFICATE_LOOK).await;
+            let tls = tls.clone();
+            match tokio::task::spawn_blocking(move || tls.reload()).await {
+                Ok(Ok(renewed)) => {
+                    failed = false;
+                    if renewed {
+                        tracing::info!(
+                            "the node's certificate changed: its next connections are made with the new one"
+                        );
+                    }
+                }
+                Ok(Err(err)) if !failed => {
+                    failed = true;
+                    tracing::warn!(
+                        err = format!("{err:#}"),
+                        "cannot read the node's certificate again; it keeps the one it has"
+                    );
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
         }
     })
 }

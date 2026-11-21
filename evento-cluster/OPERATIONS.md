@@ -345,18 +345,67 @@ writes until the others' clocks catch up.
 
 ## 4. Security (inter-node TLS)
 
-Inter-node traffic is plaintext by default (fine for a trusted network). For untrusted
-networks, use **mutual TLS with per-node certificate pinning**:
+Inter-node traffic is plaintext by default (fine for a network that is the nodes' alone).
+Between regions, or on any network shared with others, give every node a certificate
+and say where it is in the settings; the host does the rest:
 
-- Server side: `serve_tls_verified(listener, inbox, acceptor, peer_certs)` — binds each
-  connection to the `NodeId` whose pinned leaf cert it presents (authenticated identity
-  overrides the wire sender, so a node can only act as itself; a CA-valid but un-pinned
-  cert is refused).
-- Client side: `TcpTransport::with_tls(id, peers, TlsClient::new(connector, name).with_peer_certs(pins))`.
-- `PeerCerts` = `HashMap<NodeId, CertificateDer>` — the same map on every node.
+```toml
+[cluster.tls]
+ca = "/etc/cluster/tls/ca.crt"      # the authority every node's certificate is issued by
+cert = "/etc/cluster/tls/tls.crt"   # this node's certificate (and intermediates)
+key = "/etc/cluster/tls/tls.key"    # its private key
+```
 
-Cert **issuance/rotation** is an external-CA concern; supply your own rustls
-connector/acceptor. See `tests/tls_cluster.rs` for a full per-node-cert setup.
+The three files of a `kubernetes.io/tls` secret as cert-manager fills it. The same section
+on every node, each over its own files; set on every node or on none (a node with TLS and
+one without do not hear each other, and each says so). A certificate the application holds
+otherwise goes to `Cluster::builder(store).tls(NodeTls::from_pem(ca, cert, key)?)`.
+
+**Who is let in.** Every connection is mutual TLS, and a node is **who its certificate
+names**: the certificate must be issued by the authority and be valid for the host (a DNS
+SAN) or the address (an IP SAN) the node has in `peers`. A node dialling a peer checks the
+peer's certificate against the name it dialled, as any TLS client does; a node dialled by a
+peer is told which node it is and checks its certificate against the name it would dial
+that node at, then stamps that id on everything the connection carries, whatever the frames
+claim. So a certificate of the authority's lets a machine in as the nodes it names and no
+other, and anything without one is refused in the handshake. One certificate valid for
+several nodes' names (a wildcard, one Certificate for a whole StatefulSet) lets any of them
+speak as another: issue one per node where that matters. A node known under two names (one
+inside its region, one from the others) carries both in its certificate.
+
+**A node added while the cluster runs** (`Cluster::add_node`, §2) needs a certificate of
+the same authority for the address it is added with, and nothing else: the members are
+handed its address, which is all they check it against.
+
+**Renewal.** Replace the files on the node: it reads them again every few seconds and makes
+its next connections with what they hold; the connections it has stay. No node is
+restarted, the renewed one included. Files caught half replaced (the certificate without
+its key yet) leave the node on the certificate it has, with a warning, until they go
+together. The authority is changed the same way: list the old and the new one in every
+node's `ca` file, renew each node's certificate under the new one, then drop the old one.
+
+**A wrong file is not a node that is away.** A link a certificate keeps down is said apart,
+in the log when it begins (`the link to a peer is refused, and the peer is not away`) and
+in `cluster.health().peers[i].refused`:
+
+| `refused` | Meaning | Look at |
+|---|---|---|
+| `PeerCertificate(why)` | this node does not accept the peer's certificate (another authority, expired, another node's name) | the peer's files; this node's `ca` when it says so of every peer |
+| `OwnCertificate(why)` | the peer does not accept this node's | this node's files when every peer says so |
+| `NotKnown` | the peer has no address for this node | a node not added yet, or added a moment ago |
+| `Handshake(why)` | the handshake failed otherwise | a peer in clear among nodes over TLS |
+
+A connection refused before it said which node it is (a certificate of no authority this
+node trusts, dialling in) is logged with the address it came from, at most twice a minute;
+the same node is named when this node dials it.
+
+**By hand.** The host builds this from `TcpTransport::with_tls_named(id, peers, tls)` and
+`serve_tls_named(listener, inbox, tls, transport)` over one `NodeTls`. A deployment that
+would rather hand every node the others' certificates pins them instead:
+`serve_tls_verified(listener, inbox, acceptor, peer_certs)` with
+`TcpTransport::with_tls(id, peers, TlsClient::new(connector, name).with_peer_certs(pins))`
+binds each connection to the `NodeId` whose pinned leaf it presents (`tests/tls_cluster.rs`).
+Pinned, a renewal or a new node is a new map on every node.
 
 ---
 
@@ -1167,7 +1216,8 @@ does.
 - [ ] Odd `N` (3 or 5); replicas in independent failure domains.
 - [ ] **Durable** journal (`FjallJournal`/`SqlJournal`), not `InMemoryJournal`.
 - [ ] Timeouts tuned for your network (raise for WAN/geo).
-- [ ] mutual TLS (`serve_tls_verified` + pinned `PeerCerts`) on untrusted networks.
+- [ ] mutual TLS (`[cluster.tls]`, §4) on any network that is not the nodes' alone, one
+      certificate per node, and an alert on `health().peers[i].refused`.
 - [ ] `/metrics` scraped + alerts on recoveries / compaction-stall / shed / backlog.
 - [ ] `peer_absence_limit` decided: unset keeps a down node's writes shippable on
       return but lets the backlog grow toward `max_commands`; set, a node away
