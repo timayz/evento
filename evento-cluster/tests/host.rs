@@ -229,6 +229,7 @@ async fn a_write_on_one_node_is_read_on_another() {
     assert!(health.serving(), "{health:?}");
     assert!(!health.joined_at_start);
     assert!(health.peers.iter().all(|peer| !peer.given_up));
+    assert!(health.peers.iter().all(|peer| peer.reached), "{health:?}");
     // The members are the layout the cluster was founded with.
     let members = nodes[0].cluster.members();
     assert_eq!(members.epoch, 0);

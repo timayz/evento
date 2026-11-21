@@ -420,6 +420,13 @@ As PromQL, the share of flushes over 100 ms:
   metrics — `recoveries` not climbing, `compactions` advancing, `messages_shed` ~0, and
   the local backend's applied version tracking the cluster. For strict freshness, use
   `linearizable_reads` (§9) rather than a readiness gate.
+- *In touch with the others:* `health().peers` says of each peer how long since it was
+  heard from (`silent_for`) and whether this node holds a connection to it (`reached`).
+  Count a peer in touch when both hold: just back from a partition a node hears its
+  peers a moment before it reaches them, as they dial it while it dials them. A message
+  for a peer being dialled waits up to 2 s for the connection (`tcp::FRAME_HOLD`), so a
+  request asked in that moment is answered when the links are up instead of running
+  out `collect_timeout` (#603).
 
 **Subscription lag.** A node's subscriptions process events below its *stability
 watermark*: the present less `compaction_margin`, below any un-applied transaction it
