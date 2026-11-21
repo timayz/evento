@@ -1946,6 +1946,19 @@ scenario on a cluster of one). ✅ **Snapshots + compaction + log truncation** (
         *External/operator concerns (not code here):* cert **issuance** (an external CA)
         and **hot rotation** (swap the acceptor/connector + pin map; a possible future
         helper).
+        ✅ **From the host, without pins (#602):** `Settings::tls` / `Builder::tls` open a
+        node over a `NodeTls` (`tls.rs`): its certificate, its key and the authority.
+        A node is who its certificate **names** (`with_tls_named` + `serve_tls_named`):
+        the dialler checks the peer against the name it dialled; the dialled node is
+        sent the dialler's id as the connection's first frame, checks the dialler's
+        certificate against the name it would dial that node at
+        (`rustls::client::verify_server_name`, still no x509 dependency), and answers
+        welcome or why not before any frame is read. So a node added while the cluster
+        runs needs nothing handed to the members but its address, a certificate is
+        renewed by replacing one node's files (read again every 5 s), and a refusal is
+        known on both sides (`LinkRefusal`, `PeerState::refused`): the answer exists
+        because a TLS 1.3 client's handshake is done before the server read its
+        certificate. `tests/host_tls.rs`.
   - [x] **Format & upgrade story** — every bitcode record (the framed-TCP wire and the
         disk-journal *values*) now carries a 4-byte `[MAGIC | format_version | kind]`
         header (`src/format.rs`, `encode_tagged`/`decode_tagged`), so a layout change

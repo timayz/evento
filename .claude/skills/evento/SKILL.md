@@ -159,7 +159,10 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
   → `(Arc<Cluster>, ClusterExecutor<_>)`; `Settings` deserializes a `[cluster]` section
   (`node_id`, `peers`, `listen?`, `absent_after_secs`, `write_backlog`, `linearizable_reads?`),
   `None` = a node alone; a peer is `ip:port` or `host:port` (a name is resolved at each
-  dial; a node named by host must set `listen`); `cluster.health()`, `until_confirmed`, `live_nodes`, `shutdown`;
+  dial; a node named by host must set `listen`); a `tls` section (`ca`, `cert`, `key` files)
+  puts the nodes on mutual TLS, each let in as the node its certificate names (the host or
+  address it has in `peers`), renewed by replacing the files, a refused link said in
+  `health().peers[i].refused`; `cluster.health()`, `until_confirmed`, `live_nodes`, `shutdown`;
   with peers a read of one aggregate costs a consensus round (`linearizable_reads` on by
   default): `executor.local_reads()` is a cheap handle over the same node that skips it —
   build subscriptions over it and use it for reads that need no read-your-writes;

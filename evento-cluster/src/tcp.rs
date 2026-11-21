@@ -9,8 +9,8 @@
 //! Delivery is best-effort and unacknowledged — exactly what the consensus
 //! layer assumes, since quorums and recovery tolerate loss.
 //!
-//! Membership is static: construct a [`TcpTransport`] with a fixed
-//! `NodeId → PeerAddr` map. A peer is an address or a `host:port` name
+//! Construct a [`TcpTransport`] with a `NodeId → PeerAddr` map, which takes
+//! a node added since ([`TcpTransport::set_peer`]). A peer is an address or a `host:port` name
 //! ([`PeerAddr`]); a name is resolved at each dial, so a peer that comes back
 //! at another address is found again. Inbound frames are decoded and forwarded
 //! to a node's inbox by [`serve`].
@@ -21,7 +21,11 @@
 //! verifies against a shared root (the operator supplies the rustls
 //! [`TlsConnector`]/[`TlsAcceptor`]). Plain [`new`](TcpTransport::new)/[`serve`]
 //! stay available for trusted networks; the framing and consensus layers are
-//! identical either way.
+//! identical either way. [`TcpTransport::with_tls_named`] with
+//! [`serve_tls_named`] is the same over a [`NodeTls`]: each node is who its
+//! certificate names, a certificate is renewed while the node runs, and a
+//! link a certificate keeps down is said apart from a peer that is away
+//! ([`TcpTransport::refusal`]). It is what the host opens a node with.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -46,10 +50,13 @@ use crate::clock::NodeId;
 use crate::format::{decode_tagged, encode_tagged, RecordKind};
 use crate::message::Message;
 use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::tls::{self, LinkRefusal, NodeTls};
 use crate::transport::Envelope;
 
 /// Outbound connection: plain TCP, or a client-side TLS session over it.
 type ClientStream = Either<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
+/// An outbound connection, framed.
+type ClientLink = Framed<ClientStream, LengthDelimitedCodec>;
 /// Inbound connection: plain TCP, or a server-side TLS session over it.
 type ServerStream = Either<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 
@@ -109,6 +116,124 @@ impl TlsClient {
     pub fn with_peer_certs(mut self, peer_certs: PeerCerts) -> Self {
         self.peer_certs = Some(Arc::new(peer_certs));
         self
+    }
+}
+
+/// How a transport's outbound connections are secured.
+#[derive(Clone)]
+enum ClientTls {
+    /// One connector and one server name for every peer, with their
+    /// certificates pinned or not.
+    Pinned(TlsClient),
+    /// Each peer under the name it is dialled at.
+    Named(NodeTls),
+}
+
+/// How long a refusal of a peer's inbound connection stands when it is not
+/// said again: the peer redials within its backoff, so one that stopped
+/// being refused either got through or went away.
+const REFUSAL_STANDS: Duration = Duration::from_secs(10);
+
+/// The least time between two log lines about inbound connections refused
+/// before they said which node they are.
+const UNNAMED_SAID: Duration = Duration::from_secs(30);
+
+/// Why the link with a peer is refused, each way.
+#[derive(Default)]
+struct Refused {
+    /// What the last dial of the peer met.
+    dialled: Option<LinkRefusal>,
+    /// What the peer's last connection to this node was refused for, and when.
+    dialling: Option<(LinkRefusal, Instant)>,
+}
+
+/// The links of a transport that a certificate keeps down, by peer: what
+/// tells them from peers that are away. Said in the log when a refusal
+/// begins or changes, not at each redial.
+#[derive(Default)]
+struct Refusals {
+    by_peer: Mutex<HashMap<NodeId, Refused>>,
+    /// When an inbound connection refused before it named its node was last
+    /// said in the log.
+    unnamed: Mutex<Option<Instant>>,
+}
+
+impl Refusals {
+    /// What the last dial of `peer` met: `None` when it connected, or met
+    /// the network.
+    fn dialled(&self, peer: NodeId, refusal: Option<LinkRefusal>) {
+        let mut by_peer = self.by_peer.lock().expect("refusals poisoned");
+        let held = by_peer.entry(peer).or_default();
+        if held.dialled == refusal {
+            return;
+        }
+        match &refusal {
+            // A node waiting to be added: its host says so.
+            Some(LinkRefusal::NotKnown) => tracing::info!(
+                peer = peer.0,
+                "the peer does not know this node yet and refuses its connection"
+            ),
+            Some(refusal) => tracing::warn!(
+                peer = peer.0,
+                %refusal,
+                "the link to a peer is refused, and the peer is not away"
+            ),
+            None => {}
+        }
+        held.dialled = refusal;
+    }
+
+    /// What `peer`'s connection to this node was refused for; `None` when
+    /// it was accepted.
+    fn dialling(&self, peer: NodeId, refusal: Option<LinkRefusal>) {
+        let mut by_peer = self.by_peer.lock().expect("refusals poisoned");
+        let held = by_peer.entry(peer).or_default();
+        let before = held.dialling.take().map(|(refusal, _)| refusal);
+        match (&before, &refusal) {
+            (before, Some(refusal)) if before.as_ref() != Some(refusal) => tracing::warn!(
+                peer = peer.0,
+                %refusal,
+                "a peer's connection is refused, and the peer is not away"
+            ),
+            (Some(_), None) => {
+                tracing::info!(peer = peer.0, "a peer's connection is accepted again")
+            }
+            _ => {}
+        }
+        held.dialling = refusal.map(|refusal| (refusal, Instant::now()));
+    }
+
+    /// An inbound connection from `remote` failed its handshake before it
+    /// said which node it is.
+    fn unnamed(&self, remote: SocketAddr, err: &std::io::Error) {
+        // Anything else is the network, or a probe that sent nothing.
+        let Some(refusal) = LinkRefusal::of(err) else {
+            tracing::debug!(%remote, %err, "inbound handshake failed");
+            return;
+        };
+        let mut said = self.unnamed.lock().expect("refusals poisoned");
+        if said.is_some_and(|at| at.elapsed() < UNNAMED_SAID) {
+            return;
+        }
+        *said = Some(Instant::now());
+        tracing::warn!(
+            %remote,
+            %refusal,
+            "a connection to this node is refused before it said which node it is"
+        );
+    }
+
+    /// Why the link with `peer` is refused, if it is: what dialling it met,
+    /// else what its own connection was lately refused for.
+    fn of(&self, peer: NodeId) -> Option<LinkRefusal> {
+        let by_peer = self.by_peer.lock().expect("refusals poisoned");
+        let held = by_peer.get(&peer)?;
+        held.dialled.clone().or_else(|| {
+            held.dialling
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < REFUSAL_STANDS)
+                .map(|(refusal, _)| refusal.clone())
+        })
     }
 }
 
@@ -318,7 +443,9 @@ struct PeerLinks {
     /// once and every peer's queue shares the same buffer.
     senders: Mutex<HashMap<NodeId, Link>>,
     /// Client TLS settings; `None` for plaintext.
-    tls: Option<TlsClient>,
+    tls: Option<ClientTls>,
+    /// The links a certificate keeps down.
+    refusals: Arc<Refusals>,
     /// Observability counters; bumps `messages_shed` when a full peer queue drops a
     /// frame.
     metrics: Arc<Metrics>,
@@ -330,7 +457,7 @@ impl PeerLinks {
     fn new<A: Into<PeerAddr>>(
         from: NodeId,
         peers: HashMap<NodeId, A>,
-        tls: Option<TlsClient>,
+        tls: Option<ClientTls>,
     ) -> Self {
         let peers = peers.into_iter().map(|(id, addr)| (id, addr.into()));
         Self {
@@ -338,6 +465,7 @@ impl PeerLinks {
             peers: RwLock::new(peers.collect()),
             senders: Mutex::new(HashMap::new()),
             tls,
+            refusals: Arc::default(),
             metrics: Arc::new(Metrics::new()),
             queue_capacity: CHANNEL_CAPACITY,
         }
@@ -353,7 +481,15 @@ impl PeerLinks {
         let addr = self.peers.read().expect("peers poisoned").get(&to)?.clone();
         let (tx, rx) = mpsc::channel(self.queue_capacity);
         let up = Arc::new(AtomicBool::new(false));
-        tokio::spawn(peer_writer(to, addr, rx, self.tls.clone(), up.clone()));
+        tokio::spawn(peer_writer(
+            self.from,
+            to,
+            addr,
+            rx,
+            self.tls.clone(),
+            up.clone(),
+            self.refusals.clone(),
+        ));
         senders.insert(to, Link { tx: tx.clone(), up });
         Some(tx)
     }
@@ -451,7 +587,23 @@ impl TcpTransport {
         tls: TlsClient,
     ) -> Self {
         Self {
-            links: PeerLinks::new(from, peers, Some(tls)),
+            links: PeerLinks::new(from, peers, Some(ClientTls::Pinned(tls))),
+        }
+    }
+
+    /// Builds a transport whose outbound connections use mutual TLS where
+    /// each peer is who its certificate names ([`NodeTls`]): a peer is
+    /// accepted when its certificate, issued by the cluster's authority, is
+    /// valid for the host or the address it is dialled at, and once the peer
+    /// accepted this node's the same way. Pair with [`serve_tls_named`] on
+    /// the inbound side, over this same transport.
+    pub fn with_tls_named<A: Into<PeerAddr>>(
+        from: NodeId,
+        peers: HashMap<NodeId, A>,
+        tls: NodeTls,
+    ) -> Self {
+        Self {
+            links: PeerLinks::new(from, peers, Some(ClientTls::Named(tls))),
         }
     }
 
@@ -512,6 +664,15 @@ impl TcpTransport {
         self.links.reaches(peer)
     }
 
+    /// Why the link with `peer` is down while the peer answers, over TLS:
+    /// a certificate one side does not accept, where
+    /// [`reaches`](Self::reaches) alone would read as a peer that is away.
+    /// What dialling the peer last met, else what the peer's own connection
+    /// was refused for in the last seconds; `None` once a dial connects.
+    pub fn refusal(&self, peer: NodeId) -> Option<LinkRefusal> {
+        self.links.refusals.of(peer)
+    }
+
     /// A point-in-time snapshot of this transport's observability counters (only the
     /// shed count is transport-driven; the rest come from a shared node, if any).
     pub fn metrics(&self) -> MetricsSnapshot {
@@ -543,39 +704,109 @@ impl MessageSink for TcpTransport {
     }
 }
 
+/// Why a dial gave no connection.
+enum DialError {
+    /// The network: no route, no listener, a name that does not resolve, a
+    /// peer that closed.
+    Unreachable(std::io::Error),
+    /// The peer answered, and one side refused the other.
+    Refused(LinkRefusal),
+}
+
+impl From<std::io::Error> for DialError {
+    /// A failure met once TLS began says what was refused when it is TLS's.
+    fn from(err: std::io::Error) -> Self {
+        match LinkRefusal::of(&err) {
+            Some(refusal) => Self::Refused(refusal),
+            None => Self::Unreachable(err),
+        }
+    }
+}
+
+/// What a node dialled under [`ClientTls::Named`] answers the dialler's
+/// first frame (its id) with, as that frame's first byte; a refusal's reason
+/// follows.
+const WELCOME: u8 = 0;
+const NOT_NAMED: u8 = 1;
+const NOT_KNOWN: u8 = 2;
+
+/// The frame that answers a dialler with `verdict`.
+fn answer(verdict: &Result<(), LinkRefusal>) -> Bytes {
+    let why = match verdict {
+        Ok(()) => return Bytes::from_static(&[WELCOME]),
+        Err(LinkRefusal::NotKnown) => return Bytes::from_static(&[NOT_KNOWN]),
+        Err(
+            LinkRefusal::PeerCertificate(why)
+            | LinkRefusal::OwnCertificate(why)
+            | LinkRefusal::Handshake(why),
+        ) => why,
+    };
+    let mut frame = vec![NOT_NAMED];
+    frame.extend_from_slice(why.as_bytes());
+    Bytes::from(frame)
+}
+
+/// What the dialled node's answer says to the dialler.
+fn answered(frame: &[u8]) -> Result<(), LinkRefusal> {
+    match frame.split_first() {
+        Some((&WELCOME, _)) => Ok(()),
+        Some((&NOT_KNOWN, _)) => Err(LinkRefusal::NotKnown),
+        Some((&NOT_NAMED, why)) => Err(LinkRefusal::OwnCertificate(
+            String::from_utf8_lossy(why).into_owned(),
+        )),
+        _ => Err(LinkRefusal::Handshake(
+            "the peer's answer is none this node knows".into(),
+        )),
+    }
+}
+
 /// Establishes one outbound connection to `addr`, wrapping it in client TLS when
-/// configured, within [`CONNECT_TIMEOUT`]. `None` on a resolution, connect or
+/// configured, within [`CONNECT_TIMEOUT`]. An error on a resolution, connect or
 /// handshake failure, or a timeout.
-async fn connect(to: NodeId, addr: &PeerAddr, tls: &Option<TlsClient>) -> Option<ClientStream> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, dial(to, addr, tls)).await {
-        Ok(Ok(stream)) => Some(stream),
+async fn connect(
+    from: NodeId,
+    to: NodeId,
+    addr: &PeerAddr,
+    tls: &Option<ClientTls>,
+) -> Result<ClientLink, DialError> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, dial(from, to, addr, tls)).await {
+        Ok(Ok(link)) => Ok(link),
         Ok(Err(err)) => {
-            tracing::debug!(peer = to.0, %addr, %err, "connect failed");
-            None
+            match &err {
+                DialError::Unreachable(err) => {
+                    tracing::debug!(peer = to.0, %addr, %err, "connect failed")
+                }
+                DialError::Refused(refusal) => {
+                    tracing::debug!(peer = to.0, %addr, %refusal, "connect refused")
+                }
+            }
+            Err(err)
         }
         Err(_) => {
             tracing::debug!(peer = to.0, %addr, "connect timed out");
-            None
+            Err(DialError::Unreachable(std::io::ErrorKind::TimedOut.into()))
         }
     }
 }
 
 /// The unbounded dial behind [`connect`].
 async fn dial(
+    from: NodeId,
     to: NodeId,
     addr: &PeerAddr,
-    tls: &Option<TlsClient>,
-) -> std::io::Result<ClientStream> {
+    tls: &Option<ClientTls>,
+) -> Result<ClientLink, DialError> {
     let stream = match addr {
-        PeerAddr::Socket(addr) => TcpStream::connect(addr).await?,
+        PeerAddr::Socket(addr) => TcpStream::connect(addr).await,
         // Resolved here, at each dial, and every address it resolves to is
         // tried: the peer may have come back at another one.
-        PeerAddr::Host { host, port } => TcpStream::connect((host.as_str(), *port)).await?,
-    };
+        PeerAddr::Host { host, port } => TcpStream::connect((host.as_str(), *port)).await,
+    }
+    .map_err(DialError::Unreachable)?;
     let _ = stream.set_nodelay(true);
     match tls {
-        None => Ok(Either::Left(stream)),
-        Some(tls) => {
+        None => Ok(Framed::new(Either::Left(stream), codec())),
+        Some(ClientTls::Pinned(tls)) => {
             let session = tls
                 .connector
                 .connect(tls.server_name.clone(), stream)
@@ -585,13 +816,35 @@ async fn dial(
             if let Some(pins) = &tls.peer_certs {
                 if let Some(expected) = pins.get(&to) {
                     if !leaf_matches(session.get_ref().1.peer_certificates(), expected) {
-                        return Err(std::io::Error::other(
-                            "peer certificate does not match its pin",
-                        ));
+                        return Err(DialError::Refused(LinkRefusal::PeerCertificate(
+                            "it is not the certificate pinned for the node".into(),
+                        )));
                     }
                 }
             }
-            Ok(Either::Right(session))
+            Ok(Framed::new(Either::Right(session), codec()))
+        }
+        Some(ClientTls::Named(tls)) => {
+            // The handshake accepts the peer's certificate for the name it
+            // is dialled at, as any TLS client's does.
+            let name = tls::name_of(addr)
+                .map_err(|why| DialError::Refused(LinkRefusal::PeerCertificate(why)))?;
+            let session = tls.connector().connect(name, stream).await?;
+            // Then the peer says whether it accepts this node's: a handshake
+            // is done, for the dialler, before the peer read its certificate.
+            let mut link = Framed::new(Either::Right(session), codec());
+            SinkExt::<Bytes>::send(&mut link, Bytes::copy_from_slice(&from.0.to_le_bytes()))
+                .await?;
+            match link.next().await {
+                Some(Ok(frame)) => answered(&frame).map_err(DialError::Refused)?,
+                Some(Err(err)) => return Err(err.into()),
+                None => {
+                    return Err(DialError::Unreachable(
+                        std::io::ErrorKind::UnexpectedEof.into(),
+                    ))
+                }
+            }
+            Ok(link)
         }
     }
 }
@@ -624,18 +877,22 @@ async fn dial(
 /// Otherwise a partitioned peer could pin this writer for minutes after the
 /// partition heals, shedding every frame meant for it.
 async fn peer_writer(
+    from: NodeId,
     to: NodeId,
     addr: PeerAddr,
     mut rx: mpsc::Receiver<Queued>,
-    tls: Option<TlsClient>,
+    tls: Option<ClientTls>,
     up: Arc<AtomicBool>,
+    refusals: Arc<Refusals>,
 ) {
-    let mut conn: Option<Framed<ClientStream, LengthDelimitedCodec>> = None;
+    let mut conn: Option<ClientLink> = None;
     let mut backoff = RECONNECT_BACKOFF_MIN;
     // While set and in the future, the peer is not dialled.
     let mut retry_at: Option<Instant> = None;
     // Logged on the transition only, not once per dropped frame.
     let mut unreachable = false;
+    // Whether the last dial was refused by a certificate.
+    let mut refused = false;
     // Frames taken off the queue and not written yet, oldest first.
     let mut held: VecDeque<Queued> = VecDeque::new();
     // Whether what is held failed a write already.
@@ -666,29 +923,47 @@ async fn peer_writer(
                 drop_stale(&mut held);
                 continue;
             }
-            let Some(stream) = connect(to, &addr, &tls).await else {
-                // Unreachable right now: redial after the backoff, with what
-                // is still fresh then.
-                retry_at = Some(Instant::now() + backoff);
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                if !unreachable {
-                    unreachable = true;
-                    tracing::warn!(
-                        peer = to.0,
-                        %addr,
-                        hold_ms = FRAME_HOLD.as_millis() as u64,
-                        "peer unreachable; its frames wait for a redial, then are dropped"
-                    );
+            let link = match connect(from, to, &addr, &tls).await {
+                Ok(link) => link,
+                Err(err) => {
+                    // No link right now: redial after the backoff, with what
+                    // is still fresh then.
+                    retry_at = Some(Instant::now() + backoff);
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    match err {
+                        // The peer answers: said apart, when it begins, from
+                        // a peer that is away.
+                        DialError::Refused(refusal) => {
+                            refusals.dialled(to, Some(refusal));
+                            refused = true;
+                            unreachable = false;
+                        }
+                        DialError::Unreachable(_) => {
+                            refusals.dialled(to, None);
+                            refused = false;
+                            if !unreachable {
+                                unreachable = true;
+                                tracing::warn!(
+                                    peer = to.0,
+                                    %addr,
+                                    hold_ms = FRAME_HOLD.as_millis() as u64,
+                                    "peer unreachable; its frames wait for a redial, then are dropped"
+                                );
+                            }
+                        }
+                    }
+                    drop_stale(&mut held);
+                    continue;
                 }
-                drop_stale(&mut held);
-                continue;
             };
-            conn = Some(Framed::new(stream, codec()));
+            conn = Some(link);
             up.store(true, Ordering::Relaxed);
+            refusals.dialled(to, None);
             backoff = RECONNECT_BACKOFF_MIN;
             retry_at = None;
-            if unreachable {
+            if unreachable || refused {
                 unreachable = false;
+                refused = false;
                 tracing::info!(peer = to.0, %addr, "peer reachable again");
             }
             drop_stale(&mut held);
@@ -733,10 +1008,7 @@ fn drop_stale(held: &mut VecDeque<Queued>) {
 }
 
 /// Feeds every frame of `batch`, then flushes once.
-async fn write_batch(
-    framed: &mut Framed<ClientStream, LengthDelimitedCodec>,
-    batch: &VecDeque<Queued>,
-) -> std::io::Result<()> {
+async fn write_batch(framed: &mut ClientLink, batch: &VecDeque<Queued>) -> std::io::Result<()> {
     for frame in batch {
         framed.feed(frame.bytes.clone()).await?;
     }
@@ -749,9 +1021,15 @@ async fn write_batch(
 // Inbound
 // ---------------------------------------------------------------------------
 
-/// Server-side TLS for an accept loop: the acceptor, and the per-node pins when
-/// identities are verified (`None` trusts the wire `from`).
-type ServerTls = (TlsAcceptor, Option<Arc<PeerCerts>>);
+/// Server-side TLS for an accept loop.
+#[derive(Clone)]
+enum ServerTls {
+    /// The acceptor, and the per-node pins when identities are verified
+    /// (`None` trusts the wire `from`).
+    Pinned(TlsAcceptor, Option<Arc<PeerCerts>>),
+    /// Each peer under the name the transport dials it at.
+    Named(NodeTls, Arc<TcpTransport>),
+}
 
 /// The one accept loop behind every `serve*` flavour: accepts connections on
 /// `listener`, optionally completes a (verified) TLS handshake, then reads frames
@@ -764,14 +1042,21 @@ fn accept_loop(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, remote)) => {
                     let _ = stream.set_nodelay(true);
                     let inbox = inbox.clone();
                     match tls.clone() {
                         None => {
-                            tokio::spawn(read_connection(Either::Left(stream), inbox, None));
+                            tokio::spawn(read_connection(
+                                Framed::new(Either::Left(stream), codec()),
+                                inbox,
+                                None,
+                            ));
                         }
-                        Some((acceptor, pins)) => {
+                        Some(ServerTls::Named(tls, transport)) => {
+                            tokio::spawn(accept_named(stream, remote, inbox, tls, transport));
+                        }
+                        Some(ServerTls::Pinned(acceptor, pins)) => {
                             tokio::spawn(async move {
                                 // Bounded handshake: a hung dialer must not pin this
                                 // task forever.
@@ -798,7 +1083,8 @@ fn accept_loop(
                                         Some(id)
                                     }
                                 };
-                                read_connection(Either::Right(session), inbox, identity).await;
+                                let framed = Framed::new(Either::Right(session), codec());
+                                read_connection(framed, inbox, identity).await;
                             });
                         }
                     }
@@ -831,7 +1117,7 @@ pub fn serve_tls(
     inbox: mpsc::Sender<Envelope>,
     acceptor: TlsAcceptor,
 ) -> JoinHandle<()> {
-    accept_loop(listener, inbox, Some((acceptor, None)))
+    accept_loop(listener, inbox, Some(ServerTls::Pinned(acceptor, None)))
 }
 
 /// Like [`serve_tls`] but **authenticates each peer's identity** by pinning: after
@@ -845,7 +1131,81 @@ pub fn serve_tls_verified(
     acceptor: TlsAcceptor,
     peers: PeerCerts,
 ) -> JoinHandle<()> {
-    accept_loop(listener, inbox, Some((acceptor, Some(Arc::new(peers)))))
+    let pins = Some(Arc::new(peers));
+    accept_loop(listener, inbox, Some(ServerTls::Pinned(acceptor, pins)))
+}
+
+/// Like [`serve_tls_verified`] with no certificate handed around: the inbound
+/// side of a transport built [`with_tls_named`](TcpTransport::with_tls_named),
+/// over the same [`NodeTls`]. A peer presents a certificate issued by the
+/// cluster's authority and says which node it is; it is accepted when the
+/// certificate is valid for the host or the address `transport` dials that
+/// node at, and that id is stamped on every [`Envelope`]. A node added to
+/// the transport since ([`TcpTransport::set_peer`]) is accepted from then on,
+/// and a certificate renewed on a peer the next time the peer dials.
+///
+/// A connection that is refused is told why before it is closed, so the
+/// peer says so itself ([`LinkRefusal::OwnCertificate`]), and is kept for
+/// [`TcpTransport::refusal`] here.
+pub fn serve_tls_named(
+    listener: TcpListener,
+    inbox: mpsc::Sender<Envelope>,
+    tls: NodeTls,
+    transport: Arc<TcpTransport>,
+) -> JoinHandle<()> {
+    accept_loop(listener, inbox, Some(ServerTls::Named(tls, transport)))
+}
+
+/// One inbound connection under [`ServerTls::Named`]: the handshake, which
+/// checks the peer's certificate against the authority; the peer's first
+/// frame, its id; the check that the certificate names that node, answered to
+/// the peer; then its frames.
+async fn accept_named(
+    stream: TcpStream,
+    remote: SocketAddr,
+    inbox: mpsc::Sender<Envelope>,
+    tls: NodeTls,
+    transport: Arc<TcpTransport>,
+) {
+    let refusals = &transport.links.refusals;
+    // Bounded, as the peer's first frame is: a hung dialler must not pin
+    // this task forever.
+    let session = match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.acceptor().accept(stream)).await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(err)) => {
+            refusals.unnamed(remote, &err);
+            return;
+        }
+        Err(_) => return,
+    };
+    let presented = session.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+    let mut framed = Framed::new(Either::Right(session), codec());
+    let Ok(Some(Ok(hello))) = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next()).await else {
+        return;
+    };
+    let Ok(id) = <[u8; 8]>::try_from(&hello[..]) else {
+        return;
+    };
+    let from = NodeId(u64::from_le_bytes(id));
+    let verdict = match transport.peer(from) {
+        None => Err(LinkRefusal::NotKnown),
+        Some(addr) => tls::names(presented.as_deref(), &addr).map_err(LinkRefusal::PeerCertificate),
+    };
+    let told = SinkExt::<Bytes>::send(&mut framed, answer(&verdict)).await;
+    match verdict {
+        Ok(()) => {
+            refusals.dialling(from, None);
+            if told.is_ok() {
+                read_connection(framed, inbox, Some(from)).await;
+            }
+        }
+        // No node of this transport's: nothing to say of it in its place.
+        Err(LinkRefusal::NotKnown) => {
+            tracing::debug!(node = from.0, %remote, "a node not known here was refused");
+        }
+        Err(refusal) => refusals.dialling(from, Some(refusal)),
+    }
 }
 
 /// Reads framed messages from one inbound connection until it closes. When
@@ -853,11 +1213,10 @@ pub fn serve_tls_verified(
 /// (the wire `from` is ignored — impersonation-proof); otherwise the wire `from` is
 /// used.
 async fn read_connection(
-    stream: ServerStream,
+    mut framed: Framed<ServerStream, LengthDelimitedCodec>,
     inbox: mpsc::Sender<Envelope>,
     identity: Option<NodeId>,
 ) {
-    let mut framed = Framed::new(stream, codec());
     while let Some(item) = framed.next().await {
         let bytes = match item {
             Ok(bytes) => bytes,

@@ -33,7 +33,8 @@
 //! - the membership: [`Topology`] and its [`StaticTopology`], [`ShardedTopology`]
 //!   and [`DynamicTopology`] implementations, with [`Layout`] / [`ShardMap`];
 //! - the transport: [`TcpTransport`] and [`serve`] (or [`serve_tls`] /
-//!   [`serve_tls_verified`] with a [`TlsClient`] and [`PeerCerts`]), plus
+//!   [`serve_tls_verified`] with a [`TlsClient`] and [`PeerCerts`], or
+//!   [`serve_tls_named`] with a [`NodeTls`], which the host uses), plus
 //!   [`InMemoryNetwork`] for a single-node or in-process cluster;
 //! - the [`Clock`] ([`HybridLogicalClock`]) and this node's [`NodeId`];
 //! - [`Metrics`] / [`MetricsSnapshot`];
@@ -86,6 +87,7 @@ pub mod replica;
 pub mod share;
 pub mod store;
 pub mod tcp;
+pub mod tls;
 pub mod transport;
 
 pub use api::{
@@ -106,7 +108,11 @@ pub use node::{
 };
 pub use share::{shard_of, Share};
 pub use store::{InMemoryDataStore, InMemoryJournal};
-pub use tcp::{serve, serve_tls, serve_tls_verified, PeerAddr, PeerCerts, TcpTransport, TlsClient};
+pub use tcp::{
+    serve, serve_tls, serve_tls_named, serve_tls_verified, PeerAddr, PeerCerts, TcpTransport,
+    TlsClient,
+};
+pub use tls::{LinkRefusal, NodeTls, TlsSettings};
 pub use transport::InMemoryNetwork;
 
 /// The protocol-level types: what a [`Journal`] or [`DataStore`] implementor,
