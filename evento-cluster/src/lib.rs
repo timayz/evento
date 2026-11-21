@@ -101,8 +101,8 @@ pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, HISTOG
 pub use node::{
     BacklogAtCap, ChangeInProgress, CommandTooLarge, CommitOutcome, FenceNotCovered, Foundation,
     FoundedApart, Invalidated, Joining, JournalRolledBack, LostJournal, Node, NodeClosed,
-    NodeConfig, NotAMember, OpenUnconfirmed, PartialSnapshot, RejoinRequired, SweepPressure,
-    TopologyChanging, MAX_COMMAND_BYTES,
+    NodeConfig, NotAMember, OpenUnconfirmed, PartialSnapshot, ReadUnconfirmed, RejoinRequired,
+    SweepPressure, TopologyChanging, MAX_COMMAND_BYTES,
 };
 pub use share::{shard_of, Share};
 pub use store::{InMemoryDataStore, InMemoryJournal};

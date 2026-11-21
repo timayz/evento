@@ -1118,6 +1118,15 @@ serializable-but-possibly-stale reads are acceptable; turn it on for read-your-w
 real-time guarantees across nodes. The `Cluster` host turns it on wherever there are
 peers (`Settings::linearizable_reads` unset).
 
+A read the node cannot confirm fails rather than serve a stale store, after
+`collect_timeout` at most: the node reaches no majority of the key's replicas (cut off, or
+just back), a write ahead of the read is not applied here yet, or the node is still
+joining. The error carries the type `ReadUnconfirmed` under its sentence (#604): found by
+`downcast_ref` on the `anyhow` error the read returns, and in the `source` chain of a
+host's error that wraps it transparently. It is the read's counterpart of
+`WriteError::Unavailable`: nothing is wrong with the request, so a host answers it as the
+store being away for the moment (a 503), not as a failure.
+
 The setting is the node's default; each **handle** picks for itself.
 `ClusterExecutor::local_reads()` is a handle over the same node and backend whose reads
 of one aggregate skip the barrier, and `linearizable_reads()` one whose reads fence

@@ -29,8 +29,8 @@ use evento_cluster::transport::Envelope;
 use evento_cluster::{
     Clock, DataStore, DynamicTopology, FenceNotCovered, HybridLogicalClock, InMemoryDataStore,
     InMemoryJournal, InMemoryNetwork, Joining, Journal, JournalRolledBack, LostJournal,
-    MessageSink, Node, NodeConfig, NodeId, OpenUnconfirmed, ShardedTopology, StaticTopology,
-    Topology,
+    MessageSink, Node, NodeConfig, NodeId, OpenUnconfirmed, ReadUnconfirmed, ShardedTopology,
+    StaticTopology, Topology,
 };
 use evento_core::Event;
 use tokio::sync::mpsc;
@@ -2079,10 +2079,14 @@ async fn a_joining_node_refuses_a_read_barrier() {
         .await;
     }
     c.nodes[R as usize].begin_join();
-    let read = c.nodes[R as usize].read_barrier(key("base")).await;
-    assert!(
-        read.is_err(),
-        "a read barrier passed on a joining node, which holds part of its store"
+    let err = c.nodes[R as usize]
+        .read_barrier(key("base"))
+        .await
+        .expect_err("a read barrier passed on a joining node, which holds part of its store");
+    assert_eq!(
+        err.downcast_ref::<ReadUnconfirmed>(),
+        Some(&ReadUnconfirmed::Joining),
+        "refused for another reason: {err:#}"
     );
 }
 

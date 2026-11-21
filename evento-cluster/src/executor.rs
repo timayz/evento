@@ -672,7 +672,8 @@ impl<E: Executor + Clone> ClusterExecutor<E> {
     /// [`linearizable_reads`](crate::NodeConfig::linearizable_reads) says: the
     /// opposite of [`local_reads`](Self::local_reads), for the few reads that
     /// must see every committed write on a node that reads locally by
-    /// default.
+    /// default. A read the node cannot confirm fails with
+    /// [`ReadUnconfirmed`](crate::ReadUnconfirmed) under its sentence.
     pub fn linearizable_reads(&self) -> Self {
         Self {
             node: self.node.clone(),
