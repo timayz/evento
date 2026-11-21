@@ -382,6 +382,38 @@ impl std::fmt::Display for Joining {
 
 impl std::error::Error for Joining {}
 
+/// [`Node::read_barrier`] could not confirm a read: the node cannot tell,
+/// for the moment, that its store holds every write committed before the
+/// read began. Nothing about the read itself is wrong, and it passes again
+/// on its own: a host answers it as the store being away for the moment, as
+/// it does `WriteError::Unavailable` for a write.
+///
+/// Returned through `anyhow`, as the source of the sentence that says what
+/// happened: `downcast_ref` finds it on the error a read returns
+/// ([`ClusterExecutor`](crate::ClusterExecutor)'s included), and so does a
+/// walk of the `source` chain of a host's error that wraps that one
+/// transparently, which hides the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadUnconfirmed {
+    /// The node is still joining ([`Node::is_joining`]): its store is
+    /// partial, whatever its peers answer.
+    Joining,
+    /// Too few of the key's replicas answered within `collect_timeout`: the
+    /// node is cut off from a majority, or just back.
+    NoQuorum,
+    /// A write the replicas hold before the read was not applied here
+    /// within `collect_timeout`.
+    Unapplied,
+}
+
+impl std::fmt::Display for ReadUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this node cannot confirm the read for the moment")
+    }
+}
+
+impl std::error::Error for ReadUnconfirmed {}
+
 /// [`Node::write`] refused a new write: a peer saw more of this node's
 /// journal than it holds — the journal was rolled back to an older copy
 /// (#339, [`Node::rolled_back`]). The node takes no part any more; its host
@@ -6835,17 +6867,18 @@ impl Node {
     /// before the barrier began — i.e. it is linearizable. The caller must own
     /// `key` (be a replica) so the local wait actually fences its reads. Errors
     /// (quorum unreachable, or a dependency that never applies in time) surface
-    /// as an unavailable read rather than a stale one.
+    /// as an unavailable read rather than a stale one, [`ReadUnconfirmed`]
+    /// under the sentence (#604).
     ///
     /// [`ReadProbe`]: Message::ReadProbe
     pub async fn read_barrier(&self, key: Key) -> anyhow::Result<()> {
         // A node still joining holds part of its store, whatever its probes
         // say: a read here could miss writes committed long ago (as a
         // forwarded read would, which it refuses too).
-        anyhow::ensure!(
-            self.bootstrapped.load(Ordering::Acquire),
-            "this node is joining: its store is partial"
-        );
+        if !self.bootstrapped.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(ReadUnconfirmed::Joining)
+                .context("this node is joining: its store is partial"));
+        }
         // One layout for the probe: the replicas it asks are the ones it
         // counts, and a replica that installed a change to `key` since does
         // not answer it (see `retired`).
@@ -6879,7 +6912,8 @@ impl Node {
         .await;
         self.deregister(txn);
         if probes.len() < slow_q {
-            anyhow::bail!("read barrier quorum not reached for {key:?}");
+            return Err(anyhow::Error::new(ReadUnconfirmed::NoQuorum)
+                .context(format!("read barrier quorum not reached for {key:?}")));
         }
 
         // The union of every dependency the quorum witnessed: every write
@@ -6920,7 +6954,12 @@ impl Node {
             })
             .await;
         if !applied {
-            anyhow::bail!("read barrier timed out: {} deps unapplied", deps.len());
+            return Err(
+                anyhow::Error::new(ReadUnconfirmed::Unapplied).context(format!(
+                    "read barrier timed out: {} deps unapplied",
+                    deps.len()
+                )),
+            );
         }
         Ok(())
     }

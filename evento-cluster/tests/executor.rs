@@ -450,6 +450,69 @@ async fn a_local_reads_handle_skips_the_barrier() {
     );
 }
 
+/// A host's error over the store's, transparent as `thiserror` makes one:
+/// it prints as the error it wraps and hands out that error's source, so the
+/// wrapped error itself, the root, is in no walk of the chain.
+#[derive(Debug)]
+struct HostError(anyhow::Error);
+
+impl std::fmt::Display for HostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for HostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let inner: &(dyn std::error::Error + 'static) = self.0.as_ref();
+        inner.source()
+    }
+}
+
+/// A read the node cannot confirm, cut off from a majority, is told by its
+/// type (#604): `ReadUnconfirmed`, found by a downcast of the error the read
+/// returns and in the source chain of a host's error that wraps it
+/// transparently. The sentence stays what the error prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_the_node_cannot_confirm_is_told_by_its_type() {
+    use evento_cluster::ReadUnconfirmed;
+
+    let cluster = start_linearizable_impatient(3, true);
+    cluster.execs[0]
+        .write(vec![event("h", 1, "Opened")])
+        .await
+        .unwrap();
+    cluster.net.crash(NodeId(1));
+    cluster.net.crash(NodeId(2));
+
+    let err = read_through(&cluster.execs[0], "h")
+        .await
+        .expect_err("a read with no quorum is unavailable");
+    assert_eq!(
+        err.downcast_ref::<ReadUnconfirmed>(),
+        Some(&ReadUnconfirmed::NoQuorum),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("read barrier quorum not reached for"),
+        "the sentence is kept for the log: {err}"
+    );
+
+    let host = HostError(err);
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&host);
+    let mut found = None;
+    while let Some(err) = cause {
+        found = found.or(err.downcast_ref::<ReadUnconfirmed>());
+        cause = err.source();
+    }
+    assert_eq!(
+        found,
+        Some(&ReadUnconfirmed::NoQuorum),
+        "the type is in the source chain of a transparent wrapper"
+    );
+}
+
 /// On a node that reads locally by default, a handle made by
 /// `linearizable_reads` fences its reads of one aggregate (#506).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
