@@ -407,6 +407,18 @@ would rather hand every node the others' certificates pins them instead:
 binds each connection to the `NodeId` whose pinned leaf it presents (`tests/tls_cluster.rs`).
 Pinned, a renewal or a new node is a new map on every node.
 
+**The application's own channel.** What the nodes of an application say to each other
+besides the store's traffic (HTTP between them, say) can go over the same certificate
+rather than a shared secret. Build the `NodeTls` yourself (`NodeTls::from_files(&settings)`),
+hand a clone to `Cluster::builder(store).tls(..)`, which follows the files, and keep one:
+`tls.acceptor()` and `tls.connector()` are what the node accepts and dials with, as last
+read, and `.config()` of either is the rustls configuration an HTTP server or client takes
+(`evento_cluster::tls::tokio_rustls` is the version they are of). After a renewal the
+configuration is another `Arc`: take it at each connection, or build the client again when
+`Arc::ptr_eq` says it changed. The acceptor lets in any certificate of the authority's;
+`evento_cluster::tls::names(presented, &addr)` checks which node it names, as the store's
+channel does.
+
 ---
 
 ## 5. Monitoring

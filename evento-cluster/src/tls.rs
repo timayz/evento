@@ -27,6 +27,16 @@
 //! A link a certificate keeps down is not a peer that is away, and is said
 //! apart ([`LinkRefusal`]): in the log when it begins, and in
 //! [`PeerState::refused`](crate::PeerState::refused).
+//!
+//! # An application's own channel
+//!
+//! What the nodes of one application say to each other besides the store's
+//! traffic (over HTTP, say) can go over the same certificate: a clone of the
+//! [`NodeTls`] handed to the host ([`Builder::tls`](crate::host::Builder::tls))
+//! gives what the node accepts and dials with, as last read
+//! ([`NodeTls::acceptor`], [`NodeTls::connector`]), and [`names`] lets in
+//! only the nodes of the cluster, as the store's channel does. One authority,
+//! one certificate per node, renewed in place for both channels.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -42,6 +52,10 @@ use tokio_rustls::rustls::{self, AlertDescription, ClientConfig, RootCertStore, 
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::tcp::PeerAddr;
+
+/// The TLS library the acceptor and the connector of a [`NodeTls`] are of,
+/// for an application that uses them: the same version as this crate's.
+pub use tokio_rustls;
 
 /// The `[cluster.tls]` section of a deployment's configuration: where this
 /// node's certificate is, and the authority every node's is issued by. The
@@ -148,10 +162,12 @@ pub(crate) fn name_of(addr: &PeerAddr) -> Result<ServerName<'static>, String> {
 /// Whether the certificate a peer presented (`presented`, its leaf first)
 /// names the node reached at `addr`; otherwise what is wrong with it. The
 /// handshake already checked it against the authority.
-pub(crate) fn names(
-    presented: Option<&[CertificateDer<'_>]>,
-    addr: &PeerAddr,
-) -> Result<(), String> {
+///
+/// For an application's own channel between the nodes: the certificate a
+/// caller presented (`peer_certificates()` of the accepted connection)
+/// against the address the cluster knows that node at, so a certificate of
+/// the authority's lets a machine in as the nodes it names and no other.
+pub fn names(presented: Option<&[CertificateDer<'_>]>, addr: &PeerAddr) -> Result<(), String> {
     let leaf = presented
         .and_then(|chain| chain.first())
         .ok_or("no certificate was presented")?;
@@ -355,8 +371,18 @@ impl NodeTls {
         Ok(())
     }
 
-    /// What an inbound connection is accepted with, as last read.
-    pub(crate) fn acceptor(&self) -> TlsAcceptor {
+    /// What an inbound connection is accepted with, as last read: the node's
+    /// certificate presented, and a client let in only with a certificate
+    /// of the authority's. Which node the client is, is for the caller to
+    /// check ([`names`]).
+    ///
+    /// For a channel of the application's own between the nodes. The
+    /// configuration under it is [`TlsAcceptor::config`]; it is another
+    /// `Arc` once the certificate was renewed, so what is built from it once
+    /// (a server's configuration) is built again when
+    /// [`Arc::ptr_eq`] says it changed. Taken at each connection instead,
+    /// nothing is to follow.
+    pub fn acceptor(&self) -> TlsAcceptor {
         self.inner
             .current
             .read()
@@ -365,8 +391,16 @@ impl NodeTls {
             .clone()
     }
 
-    /// What a peer is dialled with, as last read.
-    pub(crate) fn connector(&self) -> TlsConnector {
+    /// What a peer is dialled with, as last read: the peer's certificate
+    /// accepted when the authority issued it for the name dialled, and the
+    /// node's own presented.
+    ///
+    /// For a channel of the application's own between the nodes. The
+    /// configuration under it is [`TlsConnector::config`], which an HTTP
+    /// client takes; it is another `Arc` once the certificate was renewed,
+    /// so a client built from it is built again when [`Arc::ptr_eq`] says
+    /// it changed.
+    pub fn connector(&self) -> TlsConnector {
         self.inner
             .current
             .read()

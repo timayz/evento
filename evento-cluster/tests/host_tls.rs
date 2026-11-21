@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use evento_cluster::host::Settings;
+use evento_cluster::tls::tokio_rustls::rustls::pki_types::ServerName;
 use evento_cluster::{
-    Cluster, ClusterExecutor, LinkRefusal, NodeConfig, NodeHealth, NodeId, NodeTls, TlsSettings,
+    Cluster, ClusterExecutor, LinkRefusal, NodeConfig, NodeHealth, NodeId, NodeTls, PeerAddr,
+    TlsSettings,
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
@@ -453,6 +455,73 @@ async fn a_certificate_that_cannot_be_used_ends_the_open() {
     assert!(from_files.reload().is_err(), "the key is the old one's");
     std::fs::write(&files.key, key).unwrap();
     assert!(from_files.reload().unwrap());
+}
+
+/// An application's own channel between the nodes goes over the nodes'
+/// certificate: what a [`NodeTls`] accepts and dials with is the
+/// application's to use, a caller is checked against the node it says it is,
+/// and a renewal reaches every clone as another configuration.
+#[tokio::test]
+async fn an_application_channel_goes_over_the_nodes_certificate() {
+    let root = temp_root("application");
+    let authority = Authority::new();
+    for id in 0..2 {
+        install(&root, id, &authority, &authority, &ip(id));
+    }
+    let caller = NodeTls::from_files(&tls_files(&root, 0)).unwrap();
+    let served = NodeTls::from_files(&tls_files(&root, 1)).unwrap();
+    // The clone an application keeps of what it handed the host.
+    let kept = served.clone();
+
+    let listener = tokio::net::TcpListener::bind(format!("{}:0", ip(1)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let name = ServerName::try_from(ip(1)).unwrap();
+    // One connection: the certificate the caller presented, as the server
+    // saw it, or how the handshake ended.
+    let call = |connector: evento_cluster::tls::tokio_rustls::TlsConnector| {
+        let (listener, acceptor, name) = (&listener, kept.acceptor(), name.clone());
+        async move {
+            let dial = async {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                connector.connect(name, stream).await
+            };
+            let accept = async {
+                let (stream, _) = listener.accept().await?;
+                acceptor.accept(stream).await
+            };
+            let (dialled, accepted) = tokio::join!(dial, accept);
+            let accepted = accepted?;
+            dialled?;
+            let presented = accepted.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+            std::io::Result::Ok(presented)
+        }
+    };
+
+    let presented = call(caller.connector()).await.unwrap();
+    let at = |id: u64| -> PeerAddr { format!("{}:7000", ip(id)).parse().unwrap() };
+    evento_cluster::tls::names(presented.as_deref(), &at(0)).unwrap();
+    let other = evento_cluster::tls::names(presented.as_deref(), &at(2)).unwrap_err();
+    assert!(other.contains("does not name"), "{other}");
+    assert!(evento_cluster::tls::names(None, &at(0)).is_err());
+
+    // A certificate of another authority is not let in.
+    let stranger = Authority::new();
+    install(&root, 2, &authority, &stranger, &ip(2));
+    let outsider = NodeTls::from_files(&tls_files(&root, 2)).unwrap();
+    assert!(call(outsider.connector()).await.is_err());
+
+    // Renewed in place: the clone holds another configuration, the one the
+    // next connections are made with, and nothing changes until then.
+    let before = kept.acceptor().config().clone();
+    let dialled_with = kept.connector().config().clone();
+    assert!(Arc::ptr_eq(&before, kept.acceptor().config()));
+    install(&root, 1, &authority, &authority, &ip(1));
+    assert!(served.reload().unwrap());
+    assert!(!Arc::ptr_eq(&before, kept.acceptor().config()));
+    assert!(!Arc::ptr_eq(&dialled_with, kept.connector().config()));
+    call(caller.connector()).await.unwrap();
 }
 
 #[test]
