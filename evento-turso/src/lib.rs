@@ -49,6 +49,7 @@ mod executor;
 pub mod migrate;
 mod query;
 mod reader;
+mod readers;
 mod row;
 pub mod write;
 

@@ -22,6 +22,7 @@ use crate::query::{
     self, filter_conditions, DeadLetterTable, EventRow, EventTable, MetaTable, Prepared,
     SnapshotTable, SubscriberTable, EVENT_COLUMNS,
 };
+use crate::readers::{ReadConnection, Readers};
 use crate::write::{self, Body, WriteMode};
 use crate::Reader;
 
@@ -163,6 +164,9 @@ pub struct Turso {
     /// next: a connection's first `BEGIN CONCURRENT` costs milliseconds
     /// (Turso sets its MVCC state up), the next ones microseconds.
     app: Arc<std::sync::Mutex<Vec<turso::Connection>>>,
+    /// The connections the store's own reads run on, kept with the
+    /// statements they prepared.
+    readers: Readers,
     /// Keeps a [`temporary`](Self::temporary) database's directory alive.
     _temp: Option<Arc<tempfile::TempDir>>,
 }
@@ -189,6 +193,7 @@ impl Clone for Turso {
             clock: Arc::clone(&self.clock),
             write_watch: self.write_watch.clone(),
             app: Arc::clone(&self.app),
+            readers: self.readers.clone(),
             _temp: self._temp.clone(),
         }
     }
@@ -307,6 +312,7 @@ impl Turso {
             None => 0,
         };
         Ok(Self {
+            readers: Readers::new(db.clone()),
             db,
             mode,
             write: Arc::new(Mutex::new(write)),
@@ -438,9 +444,9 @@ impl Turso {
         connect_read(&self.db)
     }
 
-    /// A connection for a read.
-    fn reader(&self) -> anyhow::Result<turso::Connection> {
-        self.connect_read()
+    /// A connection for a read of the store's own, kept for the next.
+    fn reader(&self) -> anyhow::Result<ReadConnection> {
+        self.readers.take()
     }
 
     /// The clock's time in whole seconds (for `created_at` / `updated_at`).
@@ -667,7 +673,7 @@ impl Executor for Turso {
         );
         reader.args(args);
         Ok(reader
-            .execute::<EventRow>(&self.reader()?)
+            .execute_on::<EventRow, _>(&self.reader()?)
             .await?
             .map(|row| row.0))
     }
@@ -1220,7 +1226,10 @@ mod tests {
     #[tokio::test]
     async fn a_read_connection_does_not_wait_on_a_lock() -> anyhow::Result<()> {
         let store = Turso::in_memory_concurrent().await?;
-        assert_eq!(busy_timeout(&store.reader()?).await?, 0);
+        assert_eq!(
+            busy_timeout(crate::readers::Reads::connection(&store.reader()?)).await?,
+            0
+        );
         assert_eq!(busy_timeout(&store.connect_read()?).await?, 0);
         assert_eq!(
             busy_timeout(&store.connect()?).await?,

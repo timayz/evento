@@ -10,6 +10,7 @@ use evento_core::{
     Event, EventCursor, EventFilter, FilterArm, RoutingKey, TenantFilter,
 };
 
+use crate::readers::Reads;
 use crate::{Bind, FromRow, Row};
 
 /// Column identifiers for the `event` table.
@@ -143,6 +144,14 @@ pub(crate) struct Prepared {
 
 #[cfg(test)]
 impl Prepared {
+    /// A statement from its text, with nothing bound.
+    pub(crate) fn raw(sql: &str) -> Self {
+        Self {
+            sql: sql.to_owned(),
+            params: Vec::new(),
+        }
+    }
+
     /// The SQL text.
     pub(crate) fn sql(&self) -> &str {
         &self.sql
@@ -259,8 +268,8 @@ const READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
 /// the thread busy (see [`BUSY_TIMEOUT`](crate::BUSY_TIMEOUT)); the patience
 /// is counted in time so that it is the same on a connection that waits on a
 /// lock and on one that does not.
-pub(crate) async fn fetch_rows(
-    conn: &Connection,
+pub(crate) async fn fetch_rows<C: Reads>(
+    conn: &C,
     query: Prepared,
 ) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
     let started = std::time::Instant::now();
@@ -279,27 +288,32 @@ pub(crate) async fn fetch_rows(
     }
 }
 
-async fn fetch_rows_once(
-    conn: &Connection,
+async fn fetch_rows_once<C: Reads>(
+    conn: &C,
     query: &Prepared,
 ) -> turso::Result<(Vec<String>, Vec<turso::Row>)> {
-    let mut rows = conn
-        .query(
-            &query.sql,
-            turso::params_from_iter(query.params.iter().cloned()),
-        )
-        .await?;
+    let params = turso::params_from_iter(query.params.iter().cloned());
+    // Kept prepared on a connection of the store's own: preparing the
+    // statement costs more than running it (see `readers`).
+    let mut kept;
+    let mut rows = if conn.begins(&query.sql) {
+        kept = conn.connection().prepare_cached(&query.sql).await?;
+        kept.query(params).await?
+    } else {
+        conn.connection().query(&query.sql, params).await?
+    };
     let columns = rows.column_names();
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
         out.push(row);
     }
+    conn.ended();
     Ok((columns, out))
 }
 
 /// Every row a rendered statement returns, decoded.
-pub(crate) async fn fetch_prepared<O: FromRow>(
-    conn: &Connection,
+pub(crate) async fn fetch_prepared<O: FromRow, C: Reads>(
+    conn: &C,
     query: Prepared,
 ) -> anyhow::Result<Vec<O>> {
     let (columns, rows) = fetch_rows(conn, query).await?;
@@ -366,16 +380,16 @@ pub async fn fetch_one<O: FromRow, S: Statement + ?Sized>(
 }
 
 /// Every row a rendered statement returns, without the column names.
-pub(crate) async fn fetch_rows_only(
-    conn: &Connection,
+pub(crate) async fn fetch_rows_only<C: Reads>(
+    conn: &C,
     query: Prepared,
 ) -> turso::Result<Vec<turso::Row>> {
     Ok(fetch_rows(conn, query).await?.1)
 }
 
 /// The first row a rendered statement returns, if any.
-pub(crate) async fn fetch_optional_prepared(
-    conn: &Connection,
+pub(crate) async fn fetch_optional_prepared<C: Reads>(
+    conn: &C,
     query: Prepared,
 ) -> turso::Result<Option<turso::Row>> {
     Ok(fetch_rows(conn, query).await?.1.into_iter().next())

@@ -51,6 +51,20 @@ async fn empty_for_join_keeps_the_schema(store: Turso) -> anyhow::Result<()> {
         ..Default::default()
     };
     store.write(vec![event("a"), event("b")]).await?;
+    // Read on a connection the store keeps, with its statement prepared.
+    let events = |store: Turso| async move {
+        let page = store
+            .read(
+                Some([evento_core::EventFilter::by_type_raw("demo/Join")].into()),
+                None,
+                evento_core::TenantFilter::All,
+                evento_core::cursor::Args::forward(10, None),
+                None,
+            )
+            .await?;
+        anyhow::Ok(page.edges.len())
+    };
+    assert_eq!(events(store.clone()).await?, 2);
     let before = schema(&store).await?;
     let stamp = store.last_stamp();
     assert!(before
@@ -69,10 +83,16 @@ async fn empty_for_join_keeps_the_schema(store: Turso) -> anyhow::Result<()> {
         "the migrations stay recorded"
     );
     assert_eq!(store.last_stamp(), stamp);
+    assert_eq!(
+        events(store.clone()).await?,
+        0,
+        "a statement prepared over the old table reads the new one"
+    );
 
     // The connections the store already held write the new tables.
     store.write(vec![event("a")]).await?;
     assert!(store.last_stamp() > stamp, "the commit clock goes on");
+    assert_eq!(events(store.clone()).await?, 1);
     Ok(())
 }
 
