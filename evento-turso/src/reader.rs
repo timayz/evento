@@ -133,6 +133,16 @@ impl Reader {
     where
         O: FromRow + Cursor + Bind<Cursor = O>,
     {
+        self.execute_on(conn).await
+    }
+
+    /// [`execute`](Self::execute) on a connection of the store's own, which
+    /// keeps the statement prepared.
+    pub(crate) async fn execute_on<O, C>(&self, conn: &C) -> anyhow::Result<ReadResult<O>>
+    where
+        O: FromRow + Cursor + Bind<Cursor = O>,
+        C: crate::readers::Reads,
+    {
         // The keyset predicate, the ORDER BY and the LIMIT go on a copy: the
         // stored statement stays the caller's base query, so the same reader
         // can be executed again (a retry, the next page, the other direction)

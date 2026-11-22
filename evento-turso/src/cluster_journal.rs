@@ -48,6 +48,7 @@ use evento_cluster::protocol::{
 use evento_cluster::{Journal, NodeId};
 
 use crate::query::{self, Prepared};
+use crate::readers::{ReadConnection, Readers};
 use crate::write::{self, WriteMode};
 
 /// `k` value under which the truncation watermark is stored in `cluster_meta`.
@@ -155,6 +156,9 @@ pub struct TursoJournal {
     mode: WriteMode,
     /// The single writer; holds the flush and truncate transactions.
     write: tokio::sync::Mutex<turso::Connection>,
+    /// The connections the journal reads on, kept with the statements they
+    /// prepared.
+    readers: Readers,
     /// Commands staged since the last [`flush`](Journal::flush), as `(key, value)`.
     staged: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     /// `cluster_meta` rows (routes, promises, decision records) staged since
@@ -194,6 +198,7 @@ impl TursoJournal {
             })?;
         let mode = write::write_mode_of(&write).await?;
         Ok(Self {
+            readers: Readers::new(db.clone()),
             db,
             mode,
             write: tokio::sync::Mutex::new(write),
@@ -266,8 +271,8 @@ impl TursoJournal {
         &self.db
     }
 
-    fn reader(&self) -> anyhow::Result<turso::Connection> {
-        crate::executor::connect_read(&self.db)
+    fn reader(&self) -> anyhow::Result<ReadConnection> {
+        self.readers.take()
     }
 
     /// Stages `value` as the `cluster_meta` row `key`, one `truncate` keeps,
