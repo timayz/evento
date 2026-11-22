@@ -488,6 +488,15 @@ As PromQL, the share of flushes over 100 ms:
   for a peer being dialled waits up to 2 s for the connection (`tcp::FRAME_HOLD`), so a
   request asked in that moment is answered when the links are up instead of running
   out `collect_timeout` (#603).
+- *A link that stays down:* the node says `peer unreachable` when a dial of a peer
+  first fails, with what it met, then `peer still unreachable` every 30 s
+  (`tcp::DIAL_SAID`) with the last dial's error, for how long and over how many dials,
+  until `peer reachable again`. Each step of a dial has its bound, and the error names
+  the one that ran out: resolving the peer's name (5 s), the connect (2 s), the TLS
+  handshake (10 s). A connect that is refused or times out is the network, or a peer
+  that is down; **a handshake that times out dial after dial is a machine short of
+  CPU**: the peer took the connection and did not get to answer. Give the nodes CPU of
+  their own (a request, on Kubernetes) before looking at the network (#610).
 
 **Subscription lag.** A node's subscriptions process events below its *stability
 watermark*: the present less `compaction_margin`, below any un-applied transaction it

@@ -383,15 +383,32 @@ fn codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
-/// Bound on a TLS handshake, so a hung or malicious dialer cannot pin an accept
-/// task forever.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on a TLS handshake, on both sides: a hung or malicious dialler
+/// cannot pin an accept task forever, nor a peer that went silent once
+/// connected its writer. The dialler's covers the peer's answer to its first
+/// frame as well ([`TcpTransport::with_tls_named`]).
+///
+/// Its own bound, well above [`CONNECT_TIMEOUT`]: a handshake is work both
+/// processes do, and on a machine short of CPU it takes seconds. Under the
+/// connect's two seconds it was given up midway and begun again at every
+/// dial, each one costing both nodes the CPU they were short of, and the
+/// link never came up (#610). A peer that took the connection is there; it
+/// is given the time to finish.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bound on an outbound dial: the TCP connect plus, over TLS, the client
-/// handshake. Without it a peer behind a dropping firewall (a partition) pins
-/// its writer for the kernel's SYN retries — about two minutes — while every
-/// frame queued for it is shed.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on the TCP connect of an outbound dial. Without it a peer behind a
+/// dropping firewall (a partition) pins its writer for the kernel's SYN
+/// retries — about two minutes — while every frame queued for it is shed.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on resolving the name of a peer named by host, at each dial: the
+/// time a resolver gives one server by default.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The least time between two log lines about a peer whose dials keep
+/// failing: said when it begins, then again this often with what the last
+/// dial met, for as long as it lasts.
+pub const DIAL_SAID: Duration = Duration::from_secs(30);
 
 /// Bound on writing one batch. A peer that stops acknowledging (partitioned, or
 /// paused) lets writes fill the kernel's send buffer, then blocks the flush on
@@ -760,36 +777,45 @@ fn answered(frame: &[u8]) -> Result<(), LinkRefusal> {
     }
 }
 
-/// Establishes one outbound connection to `addr`, wrapping it in client TLS when
-/// configured, within [`CONNECT_TIMEOUT`]. An error on a resolution, connect or
-/// handshake failure, or a timeout.
+/// Establishes one outbound connection to `addr`, wrapping it in client TLS
+/// when configured. Each step has its bound, and a step that runs out of it
+/// says which it was: the resolution of a name ([`RESOLVE_TIMEOUT`]), the
+/// connect ([`CONNECT_TIMEOUT`]), the handshake ([`HANDSHAKE_TIMEOUT`]).
 async fn connect(
     from: NodeId,
     to: NodeId,
     addr: &PeerAddr,
     tls: &Option<ClientTls>,
 ) -> Result<ClientLink, DialError> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, dial(from, to, addr, tls)).await {
-        Ok(Ok(link)) => Ok(link),
-        Ok(Err(err)) => {
-            match &err {
-                DialError::Unreachable(err) => {
-                    tracing::debug!(peer = to.0, %addr, %err, "connect failed")
-                }
-                DialError::Refused(refusal) => {
-                    tracing::debug!(peer = to.0, %addr, %refusal, "connect refused")
-                }
-            }
-            Err(err)
+    let outcome = dial(from, to, addr, tls).await;
+    match &outcome {
+        Ok(_) => {}
+        Err(DialError::Unreachable(err)) => {
+            tracing::debug!(peer = to.0, %addr, %err, "connect failed")
         }
-        Err(_) => {
-            tracing::debug!(peer = to.0, %addr, "connect timed out");
-            Err(DialError::Unreachable(std::io::ErrorKind::TimedOut.into()))
+        Err(DialError::Refused(refusal)) => {
+            tracing::debug!(peer = to.0, %addr, %refusal, "connect refused")
         }
+    }
+    outcome
+}
+
+/// `step`, given up after `bound` with an error that names it (`what`).
+async fn within<T>(
+    bound: Duration,
+    what: &str,
+    step: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match tokio::time::timeout(bound, step).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{what} took more than {bound:?}"),
+        )),
     }
 }
 
-/// The unbounded dial behind [`connect`].
+/// The dial behind [`connect`].
 async fn dial(
     from: NodeId,
     to: NodeId,
@@ -797,13 +823,47 @@ async fn dial(
     tls: &Option<ClientTls>,
 ) -> Result<ClientLink, DialError> {
     let stream = match addr {
-        PeerAddr::Socket(addr) => TcpStream::connect(addr).await,
+        PeerAddr::Socket(addr) => {
+            within(CONNECT_TIMEOUT, "the connect", TcpStream::connect(addr)).await
+        }
         // Resolved here, at each dial, and every address it resolves to is
         // tried: the peer may have come back at another one.
-        PeerAddr::Host { host, port } => TcpStream::connect((host.as_str(), *port)).await,
+        PeerAddr::Host { host, port } => {
+            let resolved = tokio::net::lookup_host((host.as_str(), *port));
+            match within(RESOLVE_TIMEOUT, "resolving the name", resolved).await {
+                Ok(addrs) => {
+                    let addrs: Vec<SocketAddr> = addrs.collect();
+                    within(
+                        CONNECT_TIMEOUT,
+                        "the connect",
+                        TcpStream::connect(&addrs[..]),
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        }
     }
     .map_err(DialError::Unreachable)?;
     let _ = stream.set_nodelay(true);
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, secure(from, to, addr, tls, stream)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(DialError::Unreachable(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("the TLS handshake took more than {HANDSHAKE_TIMEOUT:?}"),
+        ))),
+    }
+}
+
+/// What a dial does once connected: over TLS, the client handshake, and
+/// under [`ClientTls::Named`] the peer's answer to this node's id.
+async fn secure(
+    from: NodeId,
+    to: NodeId,
+    addr: &PeerAddr,
+    tls: &Option<ClientTls>,
+    stream: TcpStream,
+) -> Result<ClientLink, DialError> {
     match tls {
         None => Ok(Framed::new(Either::Left(stream), codec())),
         Some(ClientTls::Pinned(tls)) => {
@@ -870,12 +930,17 @@ async fn dial(
 /// failure finds a peer that came back at another address; a name that does
 /// not resolve is a failed dial like any other.
 ///
-/// Nothing here waits on the network unbounded: a dial gives up after
-/// [`CONNECT_TIMEOUT`] and a batch write after [`WRITE_TIMEOUT`] (which counts
-/// as a failed write), and after a failed dial the peer is not redialled until
-/// its backoff ([`RECONNECT_BACKOFF_MIN`]..[`RECONNECT_BACKOFF_MAX`]) elapses.
+/// Nothing here waits on the network unbounded: each step of a dial has its
+/// bound ([`RESOLVE_TIMEOUT`], [`CONNECT_TIMEOUT`], [`HANDSHAKE_TIMEOUT`]), a
+/// batch write gives up after [`WRITE_TIMEOUT`] (which counts as a failed
+/// write), and after a failed dial the peer is not redialled until its
+/// backoff ([`RECONNECT_BACKOFF_MIN`]..[`RECONNECT_BACKOFF_MAX`]) elapses.
 /// Otherwise a partitioned peer could pin this writer for minutes after the
 /// partition heals, shedding every frame meant for it.
+///
+/// A peer whose dials keep failing is said in the log when that begins, with
+/// what the dial met, and again every [`DIAL_SAID`] for as long as it lasts:
+/// which link is down, since when, and why.
 async fn peer_writer(
     from: NodeId,
     to: NodeId,
@@ -893,6 +958,8 @@ async fn peer_writer(
     let mut unreachable = false;
     // Whether the last dial was refused by a certificate.
     let mut refused = false;
+    // The dials that failed since the last one that connected.
+    let mut failing: Option<Failing> = None;
     // Frames taken off the queue and not written yet, oldest first.
     let mut held: VecDeque<Queued> = VecDeque::new();
     // Whether what is held failed a write already.
@@ -928,26 +995,51 @@ async fn peer_writer(
                 Err(err) => {
                     // No link right now: redial after the backoff, with what
                     // is still fresh then.
-                    retry_at = Some(Instant::now() + backoff);
+                    let now = Instant::now();
+                    retry_at = Some(now + backoff);
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    let run = failing.get_or_insert_with(|| Failing::begins(now));
+                    run.dials += 1;
                     match err {
                         // The peer answers: said apart, when it begins, from
                         // a peer that is away.
                         DialError::Refused(refusal) => {
+                            // A node waiting to be added: its host says so.
+                            if refused && refusal != LinkRefusal::NotKnown && run.says_again(now) {
+                                tracing::warn!(
+                                    peer = to.0,
+                                    %addr,
+                                    %refusal,
+                                    for_secs = run.lasted(now).as_secs(),
+                                    dials = run.dials,
+                                    "the link to a peer is still refused"
+                                );
+                            }
                             refusals.dialled(to, Some(refusal));
                             refused = true;
                             unreachable = false;
                         }
-                        DialError::Unreachable(_) => {
+                        DialError::Unreachable(err) => {
                             refusals.dialled(to, None);
                             refused = false;
                             if !unreachable {
                                 unreachable = true;
+                                run.said = now;
                                 tracing::warn!(
                                     peer = to.0,
                                     %addr,
+                                    %err,
                                     hold_ms = FRAME_HOLD.as_millis() as u64,
                                     "peer unreachable; its frames wait for a redial, then are dropped"
+                                );
+                            } else if run.says_again(now) {
+                                tracing::warn!(
+                                    peer = to.0,
+                                    %addr,
+                                    %err,
+                                    for_secs = run.lasted(now).as_secs(),
+                                    dials = run.dials,
+                                    "peer still unreachable: no dial of it connected"
                                 );
                             }
                         }
@@ -961,6 +1053,7 @@ async fn peer_writer(
             refusals.dialled(to, None);
             backoff = RECONNECT_BACKOFF_MIN;
             retry_at = None;
+            failing = None;
             if unreachable || refused {
                 unreachable = false;
                 refused = false;
@@ -993,6 +1086,40 @@ async fn peer_writer(
             held.clear();
         }
         resending = !resending;
+    }
+}
+
+/// The dials of one peer that failed one after another, and when that was
+/// last said in the log.
+struct Failing {
+    since: Instant,
+    said: Instant,
+    dials: u32,
+}
+
+impl Failing {
+    /// A run that begins at `now`, said as it begins.
+    fn begins(now: Instant) -> Self {
+        Self {
+            since: now,
+            said: now,
+            dials: 0,
+        }
+    }
+
+    /// Whether the run is to be said again at `now`: [`DIAL_SAID`] after it
+    /// last was, which this counts as.
+    fn says_again(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.said) < DIAL_SAID {
+            return false;
+        }
+        self.said = now;
+        true
+    }
+
+    /// How long the run lasted at `now`.
+    fn lasted(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.since)
     }
 }
 
@@ -1263,6 +1390,34 @@ mod tests {
         assert_eq!(links.metrics.snapshot().messages_shed, 0);
         links.enqueue(NodeId(1), Bytes::from(vec![0u8; MAX_FRAME_LENGTH + 1]));
         assert_eq!(links.metrics.snapshot().messages_shed, 1);
+    }
+
+    /// A peer whose dials keep failing is said again every [`DIAL_SAID`],
+    /// not at each dial.
+    #[test]
+    fn a_failing_dial_is_said_again_from_time_to_time() {
+        let began = Instant::now();
+        let mut run = Failing::begins(began);
+        assert!(!run.says_again(began + Duration::from_secs(1)));
+        assert!(!run.says_again(began + DIAL_SAID - Duration::from_millis(1)));
+        assert!(run.says_again(began + DIAL_SAID));
+        assert!(!run.says_again(began + DIAL_SAID + Duration::from_secs(1)));
+        assert!(run.says_again(began + DIAL_SAID * 2));
+        assert_eq!(run.lasted(began + DIAL_SAID * 2), DIAL_SAID * 2);
+    }
+
+    /// A step of a dial that runs out of its bound says which step it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_out_of_its_bound_says_which_it_was() {
+        let never = std::future::pending::<std::io::Result<()>>();
+        let err = within(CONNECT_TIMEOUT, "the connect", never)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "the connect took more than 2s");
+        assert!(within(CONNECT_TIMEOUT, "the connect", async { Ok(7) })
+            .await
+            .is_ok_and(|n| n == 7));
     }
 
     #[test]
