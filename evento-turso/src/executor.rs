@@ -809,6 +809,14 @@ impl Executor for Turso {
         Ok(())
     }
 
+    /// The file is locked to this process, and every event written to it
+    /// goes through the store or a clone of it. A second store opened apart
+    /// over the same file in this process is not heard: clone the store, or
+    /// tell its subscriptions how often to poll.
+    fn hears_every_write(&self) -> bool {
+        true
+    }
+
     fn write_watch(&self) -> Option<watch::Receiver<u64>> {
         Some(self.write_watch.subscribe())
     }

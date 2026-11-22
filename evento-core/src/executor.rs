@@ -454,6 +454,23 @@ pub trait Executor: Send + Sync + 'static {
         self.write_watch()
     }
 
+    /// Whether [`write_watch_for`](Self::write_watch_for) tells of **every**
+    /// event that reaches the store, whoever wrote it: the store is this
+    /// process's alone, and each write to it goes through this executor or
+    /// a clone of it. `false` (the default) wherever another process may
+    /// write (a SQL database), and for an executor that gives no signal.
+    ///
+    /// A subscription over such a store is woken for each event it follows,
+    /// so the poll it falls back on has nothing left to find, and it polls
+    /// far less often unless told how often
+    /// ([`SubscriptionBuilder::poll_interval`](crate::subscription::SubscriptionBuilder::poll_interval)).
+    /// An executor that says `true` and misses a write delays that event by
+    /// that longer interval; a wrapper says what the executor its
+    /// subscriptions read from says.
+    fn hears_every_write(&self) -> bool {
+        false
+    }
+
     /// An exclusive upper bound, in microseconds since the Unix epoch, on the
     /// event timestamps a subscription may safely process — or `None` for no
     /// bound (the default).
@@ -815,6 +832,10 @@ impl Executor for Evento {
 
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.inner.write_watch()
+    }
+
+    fn hears_every_write(&self) -> bool {
+        self.inner.hears_every_write()
     }
 
     fn write_watch_for(

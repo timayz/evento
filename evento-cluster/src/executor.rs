@@ -792,6 +792,12 @@ impl<E: Executor + Clone> Executor for ClusterExecutor<E> {
         }
     }
 
+    fn hears_every_write(&self) -> bool {
+        // Every event reaches the local store through the node's applier,
+        // the join copy and the imports included, each a `replicate` on it.
+        self.local.hears_every_write()
+    }
+
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         // Subscriptions read from the local backend, and committed writes are
         // applied to it via the node's `ExecutorDataStore`. That apply calls the

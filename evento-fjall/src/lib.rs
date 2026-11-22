@@ -1492,6 +1492,12 @@ impl Executor for Fjall {
         Ok(())
     }
 
+    /// The keyspace is locked to this handle and its clones: every event
+    /// written to it goes through them.
+    fn hears_every_write(&self) -> bool {
+        true
+    }
+
     fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.write_tx.subscribe())
     }
