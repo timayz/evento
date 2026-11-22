@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-cluster"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "askama",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "askama",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-remote"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "askama",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "askama",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "evento-cluster"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "evento-lock"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "quote",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "evento-remote"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "async-trait",
  "evento",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "bank",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "evento-turso"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1946,9 +1946,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "hashlink"
@@ -2317,7 +2317,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -2417,7 +2417,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jepsen-node"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "axum",
@@ -3124,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "quickstart"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -3328,7 +3328,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "restart-soak"
-version = "2.0.0-alpha.41"
+version = "2.0.0-alpha.42"
 dependencies = [
  "anyhow",
  "async-trait",
