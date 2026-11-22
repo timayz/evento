@@ -194,6 +194,15 @@ use crate::{
     TenantFilter, MAX_DEAD_LETTER_ERROR_LEN,
 };
 
+/// How often a subscription polls its store when it is not told
+/// ([`SubscriptionBuilder::poll_interval`]).
+pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often it polls, when not told, a store whose write signal tells of
+/// every event ([`Executor::hears_every_write`](crate::Executor::hears_every_write)):
+/// a net under the signal, not what finds the events.
+pub(crate) const HEARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The delay before the first restart of a supervised worker, and the most it
 /// grows to (see [`SubscriptionBuilder::supervised`]).
 pub(crate) const DEFAULT_RESTART_BACKOFF: (Duration, Duration) =
@@ -440,7 +449,9 @@ pub struct SubscriptionBuilder<E: Executor> {
     /// in `resolve_routing_key` so the hot paths never re-format it.
     resolved_key: String,
     delay: Option<Duration>,
-    poll_interval: Duration,
+    /// `None` until told: the default for the store then (see
+    /// [`poll_interval`](Self::poll_interval)).
+    poll_interval: Option<Duration>,
     /// The least time between the end of a pass and the start of the next
     /// (see [`coalesce`](Self::coalesce)).
     coalesce: Duration,
@@ -701,7 +712,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             safety_disabled: true,
             context: Default::default(),
             delay: None,
-            poll_interval: Duration::from_millis(250),
+            poll_interval: None,
             coalesce: Duration::ZERO,
             retry: Some(30),
             restart: None,
@@ -1163,17 +1174,26 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
         self
     }
 
-    /// Sets the polling interval used as a fallback when no write signal is
-    /// available.
+    /// Sets how often the subscription polls its store, besides being woken
+    /// by the writes.
     ///
     /// When the executor supports [`write_watch`](crate::Executor::write_watch)
     /// (the default backends do), an in-process write of an event this
     /// subscription follows wakes it immediately and this interval only
     /// bounds latency for writes the signal cannot observe — cross-process
     /// writers or custom executors. Backlogs are drained at full speed
-    /// regardless of this value. Default is 250ms.
+    /// regardless of this value.
+    ///
+    /// Left alone it is 250ms, and 5s over a store whose signal tells of
+    /// every event
+    /// ([`Executor::hears_every_write`](crate::Executor::hears_every_write):
+    /// an embedded store, and a cluster node over one): there a poll finds
+    /// nothing a wake-up did not bring, and each one is a read of the store
+    /// — with dozens of subscriptions at rest, most of what an idle process
+    /// does (issue #610). A worker that lost its subscription to another
+    /// notices at its next pass, so within this interval at the latest.
     pub fn poll_interval(mut self, v: Duration) -> Self {
-        self.poll_interval = v;
+        self.poll_interval = Some(v);
 
         self
     }
@@ -2439,7 +2459,14 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
             // an existing backlog is processed right away. Thereafter this paces
             // the fallback re-poll; the write signal (when available) wakes the
             // loop sooner.
-            let mut interval = interval_at(start, self.poll_interval);
+            let poll_interval = self.poll_interval.unwrap_or_else(|| {
+                if executor.hears_every_write() {
+                    HEARD_POLL_INTERVAL
+                } else {
+                    DEFAULT_POLL_INTERVAL
+                }
+            });
+            let mut interval = interval_at(start, poll_interval);
             let mut gated: Option<Duration> = None;
             // When the last pass ended, for `coalesce`.
             let mut last_pass: Option<Instant> = None;
@@ -4054,6 +4081,8 @@ mod tests {
         dead_letters: Mutex<Vec<DeadLetter>>,
         /// Fired by a test in place of a write (see [`Ledger::wrote`]).
         signal: crate::WriteSignal,
+        /// Whether the signal tells of every write (see [`Ledger::heard`]).
+        heard: AtomicBool,
         reads: AtomicUsize,
         /// While set, every read fails (see [`Ledger::away`]).
         away: AtomicBool,
@@ -4081,6 +4110,7 @@ mod tests {
                 cursor: Mutex::new(None),
                 dead_letters: Mutex::new(Vec::new()),
                 signal: crate::WriteSignal::new(),
+                heard: AtomicBool::new(false),
                 reads: AtomicUsize::new(0),
                 away: AtomicBool::new(false),
                 unreached: AtomicBool::new(false),
@@ -4135,6 +4165,12 @@ mod tests {
             })
         }
 
+        /// A store whose signal tells of every write.
+        fn heard(self) -> Self {
+            self.0.heard.store(true, Ordering::SeqCst);
+            self
+        }
+
         /// Whether the cursor is past every event.
         async fn drained(&self) -> bool {
             let after = self.0.cursor.lock().unwrap().clone();
@@ -4160,6 +4196,9 @@ mod tests {
         }
         fn write_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
             Some(self.0.signal.subscribe())
+        }
+        fn hears_every_write(&self) -> bool {
+            self.0.heard.load(Ordering::SeqCst)
         }
         fn write_watch_for(
             &self,
@@ -4618,6 +4657,38 @@ mod tests {
         subscription.shutdown().await.unwrap();
     }
 
+    /// Issue #610: a subscription left to its default polls a store whose
+    /// signal tells of every write far less often, is woken by a write all
+    /// the same, and polls as often as it is told when it is told.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_hears_every_write_is_polled_far_less_often() {
+        let _unlogged = unlogged().await;
+        const QUIET: Duration = Duration::from_secs(20);
+        let cases = [
+            (Ledger::of(0), None, 80),
+            (Ledger::of(0).heard(), None, 4),
+            (Ledger::of(0).heard(), Some(Duration::from_secs(1)), 20),
+        ];
+        for (store, told, polls) in cases {
+            let mut builder = Flaky::default().builder("sagas");
+            if let Some(interval) = told {
+                builder = builder.poll_interval(interval);
+            }
+            let subscription = builder.start(&store).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(store.reads(), 1, "the pass of the start");
+
+            tokio::time::sleep(QUIET).await;
+            assert_eq!(store.reads(), 1 + polls, "told {told:?}");
+
+            store.wrote("test/Thing", "Happened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(store.reads(), 2 + polls, "a write starts a pass at once");
+
+            subscription.shutdown().await.unwrap();
+        }
+    }
+
     /// Issue #531: with a `coalesce` window the writes of a burst are
     /// handled by one pass, and a write after a quiet time by one at once.
     #[tokio::test(start_paused = true)]
@@ -4705,6 +4776,7 @@ mod tests {
             cursor: Mutex::new(None),
             dead_letters: Mutex::new(Vec::new()),
             signal: crate::WriteSignal::new(),
+            heard: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
             away: AtomicBool::new(false),
             unreached: AtomicBool::new(false),
