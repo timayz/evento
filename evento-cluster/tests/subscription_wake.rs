@@ -3,7 +3,7 @@
 //! the store's write signal, so a subscription there handles it without
 //! waiting for a poll. That is what lets a subscription over a cluster node
 //! poll every few seconds by default
-//! ([`Executor::hears_every_write`]) instead of four times a second.
+//! ([`Executor::hears_every_write`]) instead of every second.
 
 mod common;
 

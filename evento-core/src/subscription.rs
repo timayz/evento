@@ -196,7 +196,7 @@ use crate::{
 
 /// How often a subscription polls its store when it is not told
 /// ([`SubscriptionBuilder::poll_interval`]).
-pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often it polls, when not told, a store whose write signal tells of
 /// every event ([`Executor::hears_every_write`](crate::Executor::hears_every_write)):
@@ -1184,7 +1184,7 @@ impl<E: Executor + 'static> SubscriptionBuilder<E> {
     /// writers or custom executors. Backlogs are drained at full speed
     /// regardless of this value.
     ///
-    /// Left alone it is 250ms, and 5s over a store whose signal tells of
+    /// Left alone it is 1s, and 5s over a store whose signal tells of
     /// every event
     /// ([`Executor::hears_every_write`](crate::Executor::hears_every_write):
     /// an embedded store, and a cluster node over one): there a poll finds
@@ -4665,9 +4665,9 @@ mod tests {
         let _unlogged = unlogged().await;
         const QUIET: Duration = Duration::from_secs(20);
         let cases = [
-            (Ledger::of(0), None, 80),
+            (Ledger::of(0), None, 20),
             (Ledger::of(0).heard(), None, 4),
-            (Ledger::of(0).heard(), Some(Duration::from_secs(1)), 20),
+            (Ledger::of(0).heard(), Some(Duration::from_secs(2)), 10),
         ];
         for (store, told, polls) in cases {
             let mut builder = Flaky::default().builder("sagas");
