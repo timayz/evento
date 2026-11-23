@@ -5,6 +5,8 @@
 //! poll every few seconds by default
 //! ([`Executor::hears_every_write`]) instead of four times a second.
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -18,6 +20,8 @@ use evento_core::subscription::{Context, Handler, SubscriptionBuilder};
 use evento_core::{Event, Executor};
 use evento_fjall::Fjall;
 use evento_turso::Turso;
+
+use common::addrs::free_addr;
 
 const AGG: &str = "test/Order";
 
@@ -62,11 +66,7 @@ impl<E: Executor> Handler<E> for Recorder {
 }
 
 async fn free_addrs() -> Vec<SocketAddr> {
-    let mut listeners = Vec::new();
-    for _ in 0..3 {
-        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
-    }
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..3).map(|_| free_addr("127.0.0.1")).collect()
 }
 
 async fn open<E: ClusterBackend>(

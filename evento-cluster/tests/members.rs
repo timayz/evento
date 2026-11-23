@@ -5,6 +5,8 @@
 //! is restarted meanwhile; it founds nothing. A node is removed, or
 //! replaced by a new one, by one call too, a dead one included.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +16,8 @@ use evento_cluster::host::{RejoinMark, Settings};
 use evento_cluster::{Cluster, ClusterExecutor, NodeConfig, NodeId, PeerAddr, Wait};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
+
+use common::addrs::free_addr;
 
 const AGG: &str = "test/Account";
 
@@ -41,11 +45,7 @@ fn temp_root(test: &str) -> PathBuf {
 
 /// `count` free localhost addresses.
 async fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let mut listeners = Vec::new();
-    for _ in 0..count {
-        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
-    }
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..count).map(|_| free_addr("127.0.0.1")).collect()
 }
 
 fn ids(nodes: &[u64]) -> Vec<NodeId> {

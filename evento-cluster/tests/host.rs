@@ -5,6 +5,8 @@
 //! next open; a node alone runs without settings; peers named by host are
 //! resolved when dialled; the settings and the mark round-trip.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,8 @@ use evento_cluster::{addresses, keys};
 use evento_cluster::{Cluster, ClusterExecutor, LiveNode, NodeConfig, NodeId, PeerAddr, Share};
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
+
+use common::addrs::free_addr;
 
 const AGG: &str = "test/Account";
 
@@ -40,11 +44,7 @@ fn temp_root(test: &str) -> PathBuf {
 
 /// Three free localhost addresses.
 async fn free_addrs() -> Vec<SocketAddr> {
-    let mut listeners = Vec::new();
-    for _ in 0..3 {
-        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
-    }
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..3).map(|_| free_addr("127.0.0.1")).collect()
 }
 
 /// One node of the test cluster, as an application holds it.
