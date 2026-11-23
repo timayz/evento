@@ -6,6 +6,8 @@
 //! certificate is replaced on one node while the others run; and a link a
 //! certificate keeps down is told from a peer that is away, on both sides.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +21,8 @@ use evento_cluster::{
 };
 use evento_core::{cursor::Args, Event, EventFilter, Executor, TenantFilter};
 use evento_fjall::Fjall;
+
+use common::addrs::free_addr;
 
 const AGG: &str = "test/Account";
 
@@ -52,15 +56,7 @@ fn ip(id: u64) -> String {
 
 /// A free port on each of `count` nodes' addresses.
 async fn free_addrs(count: u64) -> Vec<SocketAddr> {
-    let mut listeners = Vec::new();
-    for id in 0..count {
-        listeners.push(
-            tokio::net::TcpListener::bind(format!("{}:0", ip(id)))
-                .await
-                .unwrap(),
-        );
-    }
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..count).map(|id| free_addr(&ip(id))).collect()
 }
 
 /// An authority that issues the nodes' certificates.

@@ -23,6 +23,8 @@
 //! (300), `SIZING_STORE` the store (`fjall`, or `turso`), `SIZING_ROOT` where
 //! the stores go (the temporary directory).
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -34,6 +36,8 @@ use evento_core::subscription::{Context, Handler, SubscriptionBuilder};
 use evento_core::{Event, Executor};
 use evento_fjall::Fjall;
 use evento_turso::Turso;
+
+use common::addrs::free_addr;
 
 fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -49,10 +53,7 @@ fn ip(id: u64) -> String {
 }
 
 fn free_addrs(count: u64) -> Vec<SocketAddr> {
-    let listeners: Vec<_> = (0..count)
-        .map(|id| std::net::TcpListener::bind(format!("{}:0", ip(id))).unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..count).map(|id| free_addr(&ip(id))).collect()
 }
 
 /// A certificate for each node, issued by one authority, under `root`.

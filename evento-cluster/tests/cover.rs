@@ -7,6 +7,8 @@
 //! the lease or the cluster no longer confirms it, and a node that runs its
 //! own key from the cover takes it back when it returns.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -20,6 +22,8 @@ use evento_cluster::{keys, lease, Cluster, ClusterExecutor, Covering, NodeConfig
 use evento_core::subscription::{Context, Handler, State, SubscriptionBuilder};
 use evento_core::{Event, Executor, WriteError};
 use evento_fjall::Fjall;
+
+use common::addrs::free_addr;
 
 const AGG: &str = "test/Order";
 
@@ -103,11 +107,7 @@ fn temp_root(test: &str) -> PathBuf {
 }
 
 async fn free_addrs() -> Vec<SocketAddr> {
-    let mut listeners = Vec::new();
-    for _ in 0..3 {
-        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
-    }
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    (0..3).map(|_| free_addr("127.0.0.1")).collect()
 }
 
 /// One node: it serves `key-<id>` and covers for the keys without a node.
