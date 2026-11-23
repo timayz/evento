@@ -60,6 +60,14 @@
 //! tenant is told of that tenant's writes, never of when or how often the
 //! rest of the store is written.
 //!
+//! **Limits.** A connection the resolver has not accepted yet may send a
+//! `Hello` and nothing longer (16 KiB), and the server holds 1024 of them at
+//! most, so what peers with no credential can make it hold is bounded. A
+//! server anyone can dial sets its caps with [`ServerBuilder`]:
+//! [`max_pending`](ServerBuilder::max_pending) for those connections,
+//! [`max_connections`](ServerBuilder::max_connections) for all of them. A
+//! dial past a cap is closed at once and the client's reconnect tries again.
+//!
 //! **Addresses.** A client names its server by an [`Address`]: an IP and port,
 //! or a `host:port` looked up again on every connection attempt, so a
 //! reconnect follows a load balancer or a DNS (geo-)failover to whichever node
@@ -79,6 +87,7 @@ mod wire;
 
 pub use client::{Address, Client, ClientBuilder, ClientState, NotConnected};
 pub use server::{
-    serve, serve_tls, serve_tls_with, serve_with, Hello, Resolver, ServerHandle, Session,
+    serve, serve_tls, serve_tls_with, serve_with, Hello, Resolver, ServerBuilder, ServerHandle,
+    Session,
 };
 pub use wire::Rejection;
