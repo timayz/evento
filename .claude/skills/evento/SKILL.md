@@ -136,6 +136,12 @@ let client = evento::RemoteClient::connect("127.0.0.1:4321").await?;
   take a `tokio_rustls::TlsAcceptor`; the client side is
   `.builder(addr).tls(connector, server_name)`. Plain TCP is for trusted networks —
   a token travels in clear text there.
+- **Limits (a listener anyone can dial):** `evento::remote::ServerBuilder::new(resolver)`
+  (or `::open(exec)`) `.tls(acceptor).max_connections(n).max_pending(n).serve(listener)`.
+  Before the resolver accepts a connection the server reads a `Hello` and nothing
+  longer (16 KiB) and holds `max_pending` such connections (1024 by default);
+  `max_connections` caps all of them (no cap by default). A dial past a cap is closed
+  at once.
 - **A client that runs its own subscriptions** (a replica of a web app following the
   shared store) must keep cursors and snapshots in a store it owns, or replicas fence
   each other out of one subscription key:

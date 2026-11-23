@@ -69,7 +69,7 @@ use ulid::Ulid;
 
 use crate::wire::{
     decode_tagged, encode_tagged, ClientFrame, HelloOk, RecordKind, Rejection, Request, Response,
-    ServerFrame, Token, MAX_FRAME_LENGTH,
+    ServerFrame, Token, MAX_FRAME_LENGTH, MAX_HELLO_LENGTH,
 };
 
 /// Outbound connection: plain TCP, or a client-side TLS session over it.
@@ -1230,9 +1230,14 @@ async fn connect_and_hello(
             token: dial.token.clone(),
         },
     };
-    framed
-        .send(Bytes::from(encode_tagged(RecordKind::ClientFrame, &hello)?))
-        .await?;
+    let hello = encode_tagged(RecordKind::ClientFrame, &hello)?;
+    // The server closes on a longer first frame without a word.
+    anyhow::ensure!(
+        hello.len() <= MAX_HELLO_LENGTH,
+        "the token is too long: a hello of {} bytes, the server reads {MAX_HELLO_LENGTH}",
+        hello.len(),
+    );
+    framed.send(Bytes::from(hello)).await?;
 
     let hello = tokio::time::timeout(timeout, async {
         loop {

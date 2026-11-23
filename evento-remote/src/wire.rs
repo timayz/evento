@@ -59,6 +59,11 @@ impl RecordKind {
 /// snapshot blobs), so both sides raise the cap.
 pub const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
 
+/// The longest first frame a server reads: a `Hello` is an id and a token.
+/// [`MAX_FRAME_LENGTH`] applies once the server has accepted the connection,
+/// so a peer that has shown no credential cannot make it hold more.
+pub const MAX_HELLO_LENGTH: usize = 16 * 1024;
+
 /// Serializes `value` as a tagged frame: the 4-byte header followed by its
 /// bitcode encoding.
 pub fn encode_tagged<T: Serialize>(kind: RecordKind, value: &T) -> anyhow::Result<Vec<u8>> {

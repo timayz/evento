@@ -35,14 +35,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use evento_core::{Executor, TenantError, TenantFilter, WriteInterest, WriteSignal};
-use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -50,7 +49,7 @@ use tokio_util::either::Either;
 
 use crate::wire::{
     encode_tagged, ClientFrame, HelloOk, RecordKind, Rejection, Request, Response, ServerFrame,
-    WireReadResult, WireWriteError, MAX_FRAME_LENGTH,
+    WireReadResult, WireWriteError, MAX_FRAME_LENGTH, MAX_HELLO_LENGTH,
 };
 
 /// Capacity of a connection's outbound queue. Sends into it are awaited, so a
@@ -81,9 +80,20 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Inbound connection: plain TCP, or a server-side TLS session over it.
 type ServerStream = Either<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 
-fn codec() -> LengthDelimitedCodec {
+/// Connections that have not been accepted by the resolver yet, unless
+/// [`ServerBuilder::max_pending`] says otherwise. With [`MAX_HELLO_LENGTH`]
+/// it bounds what the server holds for peers that have shown no credential.
+const MAX_PENDING: usize = 1024;
+
+/// A flood of dials refused at a cap is said once, then counted and said
+/// again this often.
+const REFUSED_SAID_EVERY: Duration = Duration::from_secs(30);
+
+/// The codec of a connection until the resolver accepts it: a first frame
+/// longer than a `Hello` is refused at its head, before any of it is held.
+fn hello_codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME_LENGTH)
+        .max_frame_length(MAX_HELLO_LENGTH)
         .new_codec()
 }
 
@@ -179,7 +189,7 @@ pub trait Resolver: Send + Sync + 'static {
 }
 
 /// The trivial resolver: every connection gets the same executor.
-struct Static<E>(E);
+pub struct Static<E>(E);
 
 #[async_trait::async_trait]
 impl<E: Executor + Clone> Resolver for Static<E> {
@@ -216,7 +226,7 @@ pub fn serve<E: Executor + Clone>(listener: TcpListener, executor: E) -> ServerH
 /// Serves each connection on `listener` with the executor `resolver` picks
 /// for it, plaintext, until [`ServerHandle::shutdown`].
 pub fn serve_with<R: Resolver>(listener: TcpListener, resolver: R) -> ServerHandle {
-    start(listener, resolver, None)
+    ServerBuilder::new(resolver).serve(listener)
 }
 
 /// Like [`serve`], completing a TLS handshake with `acceptor` on each
@@ -237,34 +247,165 @@ pub fn serve_tls_with<R: Resolver>(
     acceptor: TlsAcceptor,
     resolver: R,
 ) -> ServerHandle {
-    start(listener, resolver, Some(acceptor))
+    ServerBuilder::new(resolver).tls(acceptor).serve(listener)
+}
+
+/// A server and its limits, for a listener that anyone can dial. The `serve*`
+/// functions are this builder with its defaults.
+///
+/// ```rust,no_run
+/// # async fn run(resolver: impl evento_remote::Resolver) -> anyhow::Result<()> {
+/// let listener = tokio::net::TcpListener::bind("0.0.0.0:4321").await?;
+/// let handle = evento_remote::ServerBuilder::new(resolver)
+///     .max_connections(10_000)
+///     .max_pending(256)
+///     .serve(listener);
+/// # let _ = handle;
+/// # Ok(())
+/// # }
+/// ```
+pub struct ServerBuilder<R> {
+    resolver: R,
+    tls: Option<TlsAcceptor>,
+    max_connections: Option<usize>,
+    max_pending: usize,
+}
+
+impl<E: Executor + Clone> ServerBuilder<Static<E>> {
+    /// A server of `executor` for every connection, as [`serve`]: tokens
+    /// presented at `Hello` are ignored.
+    pub fn open(executor: E) -> Self {
+        Self::new(Static(executor))
+    }
+}
+
+impl<R: Resolver> ServerBuilder<R> {
+    /// A server of the executor `resolver` picks for each connection, as
+    /// [`serve_with`].
+    pub fn new(resolver: R) -> Self {
+        Self {
+            resolver,
+            tls: None,
+            max_connections: None,
+            max_pending: MAX_PENDING,
+        }
+    }
+
+    /// Completes a TLS handshake with `acceptor` on each connection first, as
+    /// [`serve_tls_with`].
+    pub fn tls(mut self, acceptor: TlsAcceptor) -> Self {
+        self.tls = Some(acceptor);
+        self
+    }
+
+    /// The connections the server holds at once, pending or established.
+    /// Past it a dial is accepted and closed at once, and the client's
+    /// reconnect finds a place when one is free. No cap by default.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    /// The connections the server holds that its resolver has not accepted
+    /// yet: in their TLS handshake, yet to say `Hello`, or being resolved.
+    /// Past it a dial is accepted and closed at once. 1024 by default.
+    ///
+    /// Such a connection has shown no credential, and the server reads no
+    /// more than a `Hello` from it (16 KiB), for ten seconds at most: this
+    /// cap times that is what anonymous peers can make the server hold. A
+    /// flood of silent dials that fills it keeps honest clients out for as
+    /// long as it lasts, and the connections already established are not
+    /// touched.
+    pub fn max_pending(mut self, max: usize) -> Self {
+        self.max_pending = max;
+        self
+    }
+
+    /// Serves the connections of `listener` until [`ServerHandle::shutdown`].
+    pub fn serve(self, listener: TcpListener) -> ServerHandle {
+        start(listener, self)
+    }
+}
+
+/// The dials refused at a cap: said once, then every [`REFUSED_SAID_EVERY`]
+/// with how many were refused meanwhile.
+#[derive(Default)]
+struct Refused {
+    unsaid: u64,
+    said: Option<Instant>,
+}
+
+impl Refused {
+    fn refuse(&mut self, peer: SocketAddr, cap: &'static str, max: usize) {
+        self.unsaid += 1;
+        if self
+            .said
+            .is_some_and(|said| said.elapsed() < REFUSED_SAID_EVERY)
+        {
+            return;
+        }
+        tracing::warn!(
+            %peer,
+            cap,
+            max,
+            refused = self.unsaid,
+            "connection refused: the server holds as many as it may"
+        );
+        self.unsaid = 0;
+        self.said = Some(Instant::now());
+    }
 }
 
 /// The accept loop behind every `serve*` flavour.
-fn start<R: Resolver>(
-    listener: TcpListener,
-    resolver: R,
-    tls: Option<TlsAcceptor>,
-) -> ServerHandle {
+fn start<R: Resolver>(listener: TcpListener, builder: ServerBuilder<R>) -> ServerHandle {
+    let ServerBuilder {
+        resolver,
+        tls,
+        max_connections,
+        max_pending,
+    } = builder;
     let (shutdown_tx, mut shutdown) = watch::channel(false);
     // Wakes the connections whose executor has no `write_watch` of its own.
     let bump = WriteSignal::new();
     let resolver = Arc::new(resolver);
+    let semaphore = |max: usize| Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS)));
+    let connections = max_connections.map(semaphore);
+    let pending = semaphore(max_pending);
 
     let accept_task = tokio::spawn(async move {
+        let mut refused = Refused::default();
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
+                        // A place among all the connections, kept until this
+                        // one ends, and one among the pending, kept until the
+                        // resolver accepts it. Without both the stream is
+                        // dropped here: closed before a byte of it is read.
+                        let place = match &connections {
+                            None => None,
+                            Some(connections) => {
+                                match Arc::clone(connections).try_acquire_owned() {
+                                    Ok(place) => Some(place),
+                                    Err(_) => {
+                                        let max = max_connections.unwrap_or_default();
+                                        refused.refuse(peer, "max_connections", max);
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        let Ok(pending) = Arc::clone(&pending).try_acquire_owned() else {
+                            refused.refuse(peer, "max_pending", max_pending);
+                            continue;
+                        };
                         let _ = stream.set_nodelay(true);
-                        tokio::spawn(accept(
-                            stream,
-                            peer,
-                            Arc::clone(&resolver),
-                            tls.clone(),
-                            bump.clone(),
-                            shutdown.clone(),
-                        ));
+                        let (resolver, tls) = (Arc::clone(&resolver), tls.clone());
+                        let (bump, shutdown) = (bump.clone(), shutdown.clone());
+                        tokio::spawn(async move {
+                            let _place = place;
+                            accept(stream, peer, resolver, tls, pending, bump, shutdown).await;
+                        });
                     }
                     // Transient errors (EMFILE, ECONNABORTED, …) must not end
                     // the accept loop.
@@ -290,6 +431,7 @@ async fn accept<R: Resolver>(
     peer: SocketAddr,
     resolver: Arc<R>,
     tls: Option<TlsAcceptor>,
+    pending: OwnedSemaphorePermit,
     bump: WriteSignal,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -309,17 +451,22 @@ async fn accept<R: Resolver>(
             }
         }
     };
-    connection(stream, peer, resolver, bump, shutdown).await;
+    connection(stream, peer, resolver, pending, bump, shutdown).await;
 }
 
-type Inbound = SplitStream<Framed<ServerStream, LengthDelimitedCodec>>;
+type Wire = Framed<ServerStream, LengthDelimitedCodec>;
 
 /// Reads the first frame, which must be `Hello`: its correlation id and token.
 /// `None` closes the connection (timeout, garbage, or a protocol violation).
-async fn hello_phase(inbound: &mut Inbound, peer: SocketAddr) -> Option<(u64, Option<String>)> {
-    let item = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
+async fn hello_phase(wire: &mut Wire, peer: SocketAddr) -> Option<(u64, Option<String>)> {
+    let item = match tokio::time::timeout(HELLO_TIMEOUT, wire.next()).await {
         Ok(Some(Ok(bytes))) => bytes,
-        Ok(_) => return None, // closed, or a transport error
+        Ok(Some(Err(err))) => {
+            // A transport error, or a first frame longer than a hello.
+            tracing::debug!(%peer, %err, "no hello read, closing connection");
+            return None;
+        }
+        Ok(None) => return None,
         Err(_) => {
             tracing::debug!(%peer, "no hello within the timeout, closing connection");
             return None;
@@ -355,20 +502,55 @@ async fn closed(close: &mut Option<watch::Receiver<bool>>) {
     std::future::pending::<()>().await
 }
 
-/// One established connection: a writer task draining the outbound queue, the
-/// `Hello` exchange that resolves its executor, a notify task forwarding write
+/// One connection: the `Hello` exchange that resolves its executor, then a
+/// writer task draining the outbound queue, a notify task forwarding write
 /// notifications, and the inbound read loop spawning a handler per request.
+/// `pending` is its place among the connections not accepted yet.
 async fn connection<R: Resolver>(
     stream: ServerStream,
     peer: SocketAddr,
     resolver: Arc<R>,
+    pending: OwnedSemaphorePermit,
     bump: WriteSignal,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let framed = Framed::new(stream, codec());
+    let mut framed = Framed::new(stream, hello_codec());
+
+    // Hello: the first frame names the credential; the resolver turns it into
+    // the executor this connection is served with, or a refusal.
+    let hello = tokio::select! {
+        hello = hello_phase(&mut framed, peer) => hello,
+        _ = shutdown.changed() => None,
+    };
+    let Some((hello_id, token)) = hello else {
+        return;
+    };
+    let session = match resolver.resolve(&Hello { token, peer }).await {
+        Ok(session) => session,
+        Err(rejection) => {
+            tracing::debug!(%peer, %rejection, "connection refused");
+            let frame = ServerFrame::Response {
+                id: hello_id,
+                response: Response::Hello(Err(rejection)),
+                stable_timestamp: None,
+            };
+            // The limit is the encoder's too, and a refusal may say more
+            // than a hello; nothing is read from the connection any more.
+            framed.codec_mut().set_max_frame_length(MAX_FRAME_LENGTH);
+            if let Ok(bytes) = encode_tagged(RecordKind::ServerFrame, &frame) {
+                let _ = framed.send(Bytes::from(bytes)).await;
+            }
+            return;
+        }
+    };
+    // Accepted: the connection may send frames of any length the wire
+    // allows, and leaves its place to the next dial.
+    framed.codec_mut().set_max_frame_length(MAX_FRAME_LENGTH);
+    drop(pending);
+
     let (mut sink, mut inbound) = framed.split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerFrame>(OUT_CAPACITY);
-    let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
 
     let writer = tokio::spawn(async move {
         // Coalesce: feed this frame plus everything already queued, then flush
@@ -394,33 +576,6 @@ async fn connection<R: Resolver>(
         }
     });
 
-    // Hello: the first frame names the credential; the resolver turns it into
-    // the executor this connection is served with, or a refusal.
-    let hello = tokio::select! {
-        hello = hello_phase(&mut inbound, peer) => hello,
-        _ = shutdown.changed() => None,
-    };
-    let Some((hello_id, token)) = hello else {
-        drop(out_tx);
-        let _ = writer.await;
-        return;
-    };
-    let session = match resolver.resolve(&Hello { token, peer }).await {
-        Ok(session) => session,
-        Err(rejection) => {
-            tracing::debug!(%peer, %rejection, "connection refused");
-            let _ = out_tx
-                .send(ServerFrame::Response {
-                    id: hello_id,
-                    response: Response::Hello(Err(rejection)),
-                    stable_timestamp: None,
-                })
-                .await;
-            drop(out_tx);
-            let _ = writer.await;
-            return;
-        }
-    };
     let Session {
         executor,
         tenant,
@@ -1060,6 +1215,14 @@ mod watch_tests {
         }
     }
 
+    /// A client's side of a connection, nothing said yet.
+    async fn dial(addr: SocketAddr) -> Wire {
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_LENGTH)
+            .new_codec();
+        Framed::new(TcpStream::connect(addr).await.unwrap(), codec)
+    }
+
     fn watch(watch: u64, aggregate_type: &str) -> ClientFrame {
         ClientFrame::Watch {
             watch,
@@ -1089,7 +1252,7 @@ mod watch_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = serve(listener, store.clone());
-        let mut wire = Framed::new(TcpStream::connect(addr).await.unwrap(), codec());
+        let mut wire = dial(addr).await;
         settle(&mut wire, 0).await;
 
         // Nothing is watched yet: the write is answered by nothing.
@@ -1132,5 +1295,180 @@ mod watch_tests {
         assert_eq!(notified(&mut wire).await, [1]);
         store.write(vec![event("test/Card", "c1")]).await.unwrap();
         assert_eq!(notified(&mut wire).await, [3]);
+    }
+}
+
+/// Issue #615: what a connection may make the server hold before its
+/// resolver has accepted it, and how many connections the server holds.
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use evento_core::Event;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Wire = Framed<TcpStream, LengthDelimitedCodec>;
+
+    fn hello(id: u64) -> Bytes {
+        let frame = ClientFrame::Request {
+            id,
+            request: Request::Hello { token: None },
+        };
+        Bytes::from(encode_tagged(RecordKind::ClientFrame, &frame).unwrap())
+    }
+
+    /// Dials and says hello: the connection once the server has answered, or
+    /// `None` when the server closed it instead.
+    async fn connect(addr: SocketAddr) -> Option<Wire> {
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_LENGTH)
+            .new_codec();
+        let mut wire = Framed::new(TcpStream::connect(addr).await.unwrap(), codec);
+        wire.send(hello(0)).await.ok()?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), wire.next())
+            .await
+            .expect("an answer or a close within 5s");
+        reply?.ok().map(|_| wire)
+    }
+
+    /// Dials until the server answers a hello: a place freed by a connection
+    /// that went away is free once the server has seen it go.
+    async fn connect_in_time(addr: SocketAddr) -> Wire {
+        for _ in 0..100 {
+            if let Some(wire) = connect(addr).await {
+                return wire;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no place for a connection within 5s");
+    }
+
+    /// Whether the server closes `stream` within two seconds, well short of
+    /// the hello timeout.
+    async fn closed(stream: &mut TcpStream) -> bool {
+        let mut buf = [0u8; 16];
+        // A close with bytes left unread is a reset: an error, like the end.
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await,
+            Ok(Ok(0) | Err(_))
+        )
+    }
+
+    async fn listen() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn a_first_frame_longer_than_a_hello_closes_the_connection() {
+        let (listener, addr) = listen().await;
+        let _server = serve(listener, evento_fjall::Fjall::temporary().unwrap());
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let announced = u32::try_from(MAX_FRAME_LENGTH).unwrap();
+        stream.write_all(&announced.to_be_bytes()).await.unwrap();
+        assert!(
+            closed(&mut stream).await,
+            "the head alone is refused, none of the frame is waited for"
+        );
+
+        // One byte past a hello is past the limit too.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let announced = u32::try_from(MAX_HELLO_LENGTH + 1).unwrap();
+        stream.write_all(&announced.to_be_bytes()).await.unwrap();
+        assert!(closed(&mut stream).await);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_connection_sends_frames_longer_than_a_hello() {
+        let (listener, addr) = listen().await;
+        let _server = serve(listener, evento_fjall::Fjall::temporary().unwrap());
+        let mut wire = connect(addr).await.expect("the server answers a hello");
+
+        let event = Event {
+            id: ulid::Ulid::generate(),
+            aggregate_type: "test/Account".to_owned(),
+            aggregate_id: "a0".to_owned(),
+            version: 1,
+            name: "Probed".to_owned(),
+            data: vec![7; 64 * MAX_HELLO_LENGTH],
+            ..Default::default()
+        };
+        let frame = ClientFrame::Request {
+            id: 1,
+            request: Request::Write {
+                events: vec![event],
+            },
+        };
+        let bytes = encode_tagged(RecordKind::ClientFrame, &frame).unwrap();
+        assert!(bytes.len() > MAX_HELLO_LENGTH);
+        wire.send(Bytes::from(bytes)).await.unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(5), wire.next())
+            .await
+            .expect("a reply within 5s")
+            .expect("the connection is open")
+            .unwrap();
+        let reply: ServerFrame =
+            crate::wire::decode_tagged(RecordKind::ServerFrame, &bytes).unwrap();
+        assert!(
+            matches!(
+                reply,
+                ServerFrame::Response {
+                    id: 1,
+                    response: Response::Write(Ok(())),
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_past_the_pending_cap_is_closed_at_once() {
+        let (listener, addr) = listen().await;
+        let _server = ServerBuilder::open(evento_fjall::Fjall::temporary().unwrap())
+            .max_pending(2)
+            .serve(listener);
+
+        // Accepted connections hold no pending place.
+        let mut established = Vec::new();
+        for _ in 0..3 {
+            established.push(connect(addr).await.expect("the server answers a hello"));
+        }
+
+        let silent = [
+            TcpStream::connect(addr).await.unwrap(),
+            TcpStream::connect(addr).await.unwrap(),
+        ];
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            closed(&mut refused).await,
+            "a third connection that has not said hello is refused"
+        );
+        assert!(
+            connect(addr).await.is_none(),
+            "a hello has no place either while two are pending"
+        );
+
+        // A pending connection that goes away leaves its place.
+        let [gone, _kept] = silent;
+        drop(gone);
+        connect_in_time(addr).await;
+    }
+
+    #[tokio::test]
+    async fn a_dial_past_the_connection_cap_is_closed_at_once() {
+        let (listener, addr) = listen().await;
+        let _server = ServerBuilder::open(evento_fjall::Fjall::temporary().unwrap())
+            .max_connections(2)
+            .serve(listener);
+
+        let first = connect(addr).await.expect("the server answers a hello");
+        let _second = connect(addr).await.expect("the server answers a hello");
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        assert!(closed(&mut refused).await, "a third connection is refused");
+
+        drop(first);
+        connect_in_time(addr).await;
     }
 }
