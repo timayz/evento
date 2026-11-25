@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-cluster"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "askama",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-fjall"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "askama",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-remote"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "askama",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "bank-axum-sqlite"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "askama",
@@ -839,9 +839,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.9"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "844c5c0b65be192cb68d570cca1b21a6444431d24e39c084dc0336177015337c"
+checksum = "50066ca966813ca8957ee15361752f19424a8ff620dbe9c8993d9f99d99b04b3"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -849,9 +849,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.7"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+checksum = "a0ed97c96ef4efb3cc84e09fa388df4463e7cc3224ec38d7b1d9e45749333590"
 dependencies = [
  "anstream",
  "anstyle",
@@ -984,9 +984,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.5"
+version = "1.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+checksum = "fd9ae8fcb3ea71b0b26338b4ffb13006bb175de8fd07921089a906ce7e5e6945"
 dependencies = [
  "cfg-if",
 ]
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "evento"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "evento-cluster"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "evento-core"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "evento-fjall"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "evento-lock"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "quote",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "evento-macro"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "evento-remote"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "evento-sql-migrator"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "async-trait",
  "evento",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "evento-test"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "bank",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "evento-turso"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2072,9 +2072,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+checksum = "229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2417,7 +2417,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jepsen-node"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "axum",
@@ -3124,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "quickstart"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -3328,7 +3328,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "restart-soak"
-version = "2.0.0-alpha.42"
+version = "2.0.0-alpha.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4488,9 +4488,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.2+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+checksum = "26b1f26e9485c1fa43ee89fe76e9f3fb9e2e52bb227f8594b4d687496b83d073"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -4512,9 +4512,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.6+spec-1.1.0"
+version = "1.1.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
+checksum = "0bb28d6e049a9766c3bd91a8326e6179f5b132dec87906bb97018ef7a2f3431a"
 dependencies = [
  "winnow",
 ]
@@ -5492,18 +5492,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.64"
+version = "0.8.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed43f3060383c64b000f3c630550aebdfa9d3b76d48de32390483dd2cc7e0865"
+checksum = "32bc8a75f879cd6fe53a6bedf3c28f0e1b914c77424fc2be9e2ec85d7d25aff5"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.64"
+version = "0.8.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"
+checksum = "b8bfd2644ea1681f60cf95029ff18aa8ad1cc3f7b8fe37286f8e473bb29f816b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5580,27 +5580,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+checksum = "b04655dc7bf4abd8ebe23dac6bef20fceea52a29ad19e37a4101b3951d7e8b45"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.4.1"
+version = "7.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+checksum = "df2575690b2a3eccad509fe7898cdde32a5afca06a06449ff4dcfb318c7b7281"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.3+zstd.1.5.7"
+version = "2.2.0+zstd.1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
 dependencies = [
  "cc",
  "pkg-config",
