@@ -3,9 +3,10 @@ name: evento
 description: >-
   Build event-sourcing / CQRS / DDD features in Rust with the `evento` crate.
   Use when defining aggregates and events, writing commands that commit events,
-  building projections/read models, wiring subscriptions, or setting up the
+  building read models (projections kept current by a projection subscription),
+  wiring subscriptions for sagas and stats, or setting up the
   SQL/Fjall/Turso/remote executor and migrations. Triggers on `#[evento::aggregate]`,
-  `evento::create`/`evento::append`, `Projection`, `SubscriptionBuilder`,
+  `evento::create`/`evento::append`, `Projection`, `Snapshot`, `SubscriptionBuilder`,
   `Executor`, or a Cargo dependency on `evento`.
 ---
 
@@ -22,7 +23,7 @@ executor (`remote`), and a consensus-replicated executor (`evento-cluster`, alph
 
 ```toml
 [dependencies]
-evento = { version = "2.0.0-alpha.35", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "turso", "remote"
+evento = { version = "2.0.0-alpha.43", features = ["sqlite"] }  # or "postgres", "mysql", "fjall", "turso", "remote"
 bitcode = "0.6"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
@@ -272,6 +273,17 @@ evento::append(&id)
 
 ## 3. Projections (read models)
 
+The read model of an aggregate is a projection, not a subscription:
+
+- **One aggregate by id** (a detail page, the state a command checks):
+  `projection.load(id)`. It restores the snapshot and folds every event written after
+  it, past the stability watermark too, so it shows a write that just happened.
+- **Lists and search**: make the snapshot a row of your own table (*Snapshots*, below)
+  and keep every row current with `projection.subscription(key).start(&exec)`; query the
+  table. The rows trail the writes by the stability margin (see Gotchas).
+- **A `SubscriptionBuilder` (§4)** is for sagas and stats, not for the row of one
+  aggregate.
+
 `#[evento::projection]` adds a `cursor` field and implements `ProjectionCursor`.
 Options: `cursor = <Type>` (custom cursor type, e.g. `evento::cursor::Value`);
 `id = <field>` (also implements `ProjectionAggregate` → enables `view.write()`);
@@ -314,7 +326,7 @@ let view: Option<AccountView> = Projection::<_, AccountView>::new::<Account>()
 `ProjectionSubscription`. On `LoadBuilder`, register related aggregates with
 `.aggregate::<Other>(other_id)` and read them in a handler via `context.aggregate::<Other>()`.
 
-### Snapshots — three modes
+### Snapshots — four modes
 
 - **Executor-backed** (default): give the projection bitcode derives —
   `#[evento::projection(bitcode::Encode, bitcode::Decode)]` — and snapshots are
@@ -326,8 +338,90 @@ let view: Option<AccountView> = Projection::<_, AccountView>::new::<Account>()
 - **`#[evento::snapshot(memory)]`**: process-local table keyed by aggregate id;
   read materialized rows with `View::snapshot_rows().read().unwrap()`.
 - **`#[evento::snapshot(none)]`**: no snapshots, always replay.
+- **A table of your own** — the read model: implement `Snapshot` by hand. The row *is*
+  the snapshot: `restore` reads it, `take_snapshot` upserts it, `drop_snapshot` deletes it.
 
-Projections backed by a custom table (SQL, …) implement `Snapshot` by hand.
+```rust
+use evento::{Executor, projection::{Context, Projection, Snapshot}};
+use sqlx::SqlitePool;
+
+// No bitcode derives and no `#[evento::snapshot]`: the table is the snapshot.
+#[evento::projection]
+pub struct AccountView { pub owner: String, pub balance: i64 }
+
+pub fn account_view<E: Executor>(pool: SqlitePool) -> Projection<E, AccountView> {
+    Projection::new::<Account>()
+        .handler(on_opened())
+        .handler(on_deposited())
+        .data(pool) // reaches the impl below through `context.extract()`
+}
+
+impl<E: Executor> Snapshot<E> for AccountView {
+    async fn restore(context: &Context<'_, E>) -> anyhow::Result<Option<Self>> {
+        let pool: SqlitePool = context.extract();
+        let row: Option<(String, i64, String, i64)> = sqlx::query_as(
+            "SELECT owner, balance, cursor, aggregate_version FROM accounts
+             WHERE tenant = ?1 AND id = ?2",
+        )
+        .bind(&context.tenant).bind(&context.id)
+        .fetch_optional(&pool).await?;
+        Ok(row.map(|(owner, balance, cursor, version)| AccountView {
+            owner, balance, cursor, aggregate_version: version as u16, ..Default::default()
+        }))
+    }
+
+    async fn take_snapshot(&self, context: &Context<'_, E>) -> anyhow::Result<()> {
+        let pool: SqlitePool = context.extract();
+        sqlx::query(
+            "INSERT INTO accounts (tenant, id, owner, balance, cursor, aggregate_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (tenant, id) DO UPDATE SET owner = excluded.owner,
+                balance = excluded.balance, cursor = excluded.cursor,
+                aggregate_version = excluded.aggregate_version",
+        )
+        .bind(&context.tenant).bind(&context.id).bind(&self.owner).bind(self.balance)
+        .bind(&self.cursor).bind(self.aggregate_version as i64)
+        .execute(&pool).await?;
+        Ok(())
+    }
+
+    // Called by the projection subscription on the `.tombstone::<Ev>()` event.
+    async fn drop_snapshot(context: &Context<'_, E>) -> anyhow::Result<()> {
+        let pool: SqlitePool = context.extract();
+        sqlx::query("DELETE FROM accounts WHERE tenant = ?1 AND id = ?2")
+            .bind(&context.tenant).bind(&context.id)
+            .execute(&pool).await?;
+        Ok(())
+    }
+}
+
+// Keep every row current; the key is the cursor identity, keep it stable.
+let sub = account_view(pool.clone()).subscription("accounts").supervised().start(&executor).await?;
+// One account, without lag: its row, then the events written after it.
+let view = account_view(pool.clone()).load(&id).execute(&executor).await?;
+// Lists and search: query `accounts`.
+```
+
+- **Keep `cursor` and `aggregate_version` with the data, in one statement.** `restore`
+  gives both back: the cursor is where the load goes on from, the version is what
+  `write()` commits at (left at 0, a commit fails with `InvalidOriginalVersion`). Key
+  the row by `context.tenant` and `context.id`; the `tenant` field is set by the load.
+- **No bitcode derives on it**, nor `#[evento::snapshot]`: they bring an impl of their
+  own, which conflicts with yours.
+- **A row holds the stable prefix only.** Any load calls `take_snapshot`, but only with
+  the events below `stable_timestamp`; the newer ones are folded into what the load
+  returns and written by a later pass. Right after a write, a load returns the new
+  state while the row still shows the old one.
+- **`.tombstone::<Ev>()`** makes the subscription call `drop_snapshot` and a load answer
+  `None`, for one more read per load (it looks for the tombstone first).
+- **`.revision(n)` does not reach your table**: it keys executor snapshots only. Change
+  the table's shape with a migration and a new subscription key, so the projection
+  replays into the new rows.
+- **Over a `Sidecar`** the row is local and the events after it come from the events
+  store: a load is one round trip there, warm row or not.
+- **A projection subscription follows co-keyed aggregates only** (secondary aggregates
+  under the same id). Data of an aggregate under another id comes from
+  `LoadBuilder::aggregate` at load time, or from a `SubscriptionBuilder`.
 
 ### Commands and the write gateway (`#[evento::command]`)
 
@@ -371,11 +465,16 @@ impl<E: Executor> Command<E> {
 // Callers: cmd.withdraw_money(id, 50).await? / cmd.withdraw_money_with_routing(id, 50, "eu").await?
 ```
 
-## 4. Subscriptions (continuous side effects)
+## 4. Subscriptions (sagas and stats)
+
+A `SubscriptionBuilder` is for what is not the state of one aggregate: sagas (an event
+that leads to a command on another aggregate, a mail, a webhook) and stats (counters
+and tables across many aggregates). The row of one aggregate is a projection kept by a
+projection subscription (§3), which a page can also load by id without lag.
 
 `#[evento::subscription]` handlers take the context first, then the event:
-`(context: &Context<'_, E>, event: Event<SomeEvent>)`. They may do side effects
-(read models, notifications) via `context.executor` and `context.extract::<T>()` —
+`(context: &Context<'_, E>, event: Event<SomeEvent>)`. They do their side effects
+via `context.executor` and `context.extract::<T>()` —
 `.data(v)` stores `v` under its own type, and `extract` clones it, so `T` must be `Clone`
 and cheap to clone; wrap anything else in `Data` and extract `Data<T>`.
 `context.try_extract::<T>()?` returns a `MissingData` error instead of panicking.
@@ -446,7 +545,8 @@ sub.shutdown().await?;
 - Process **all** raw events of an aggregate (no payload deserialization) with
   `#[evento::subscription_all]` + `event: evento::metadata::RawEvent<Account>`;
   call `event.decode()?` for the typed `AccountEvent` when you want it.
-- Keep a projection auto-updated: `Projection::new::<A>().handler(..).subscription("key").start(&exec)`.
+- Keep a projection's rows current: `Projection::new::<A>().handler(..).subscription("key").start(&exec)`
+  (§3, *A table of your own*).
 
 ## 5. Reading events directly
 
@@ -498,6 +598,12 @@ aggregate type as a string; it has no `.decode()`.
   they read every tenant, handlers see `event.tenant` (write back with
   `.tenant(&event.tenant)`), and a projection subscription loads each event in its
   own tenant.
+- **Subscriptions trail the writes by the stability margin.** They handle an event once
+  it is below `stable_timestamp` (SQL: `stable_margin`, 1 s by default; a cluster: the
+  node's watermark; Fjall and Turso: none), so a table they fill, projection subscription
+  or not, shows a write about that long after it. `load(id)` reads past the watermark:
+  use it where a page must show the write that just happened (on a cluster, not through
+  `local_reads()`).
 - **The subscription key is the cursor identity.** Reusing a key across two different
   subscriptions makes them share (and corrupt) one cursor. Keep keys unique — except under
   `.ephemeral()`, where nothing is stored under the key and any number of subscriptions may
