@@ -173,7 +173,10 @@ let executor = evento::Sidecar::from((client, local));        // events: client;
   with peers a read of one aggregate costs a consensus round (`linearizable_reads` on by
   default): `executor.local_reads()` is a cheap handle over the same node that skips it —
   build subscriptions over it and use it for reads that need no read-your-writes;
-  `executor.linearizable_reads()` is the opposite;
+  `executor.linearizable_reads()` is the opposite. A remote listener whose clients'
+  pages load what their users just wrote serves the executor itself (not
+  `local_reads()`): its loads of one aggregate wait behind the barrier, and the broad
+  reads of their subscriptions stay local all the same;
   `Cluster::mark_for_rejoin(dir)` for a lost store
   (`examples/bank-axum-cluster/`, `evento-cluster/OPERATIONS.md` §2). A deployer
   touches only the crate root; the protocol's types (`TxnId`, `CommandState`,
@@ -422,6 +425,14 @@ let view = account_view(pool.clone()).load(&id).execute(&executor).await?;
 - **A projection subscription follows co-keyed aggregates only** (secondary aggregates
   under the same id). Data of an aggregate under another id comes from
   `LoadBuilder::aggregate` at load time, or from a `SubscriptionBuilder`.
+- **A saga that finds aggregates through such a table** (the plats of an owner, to
+  take a deleted recipe out of) cannot count on the projection subscription being as
+  far as it is. Have the saga load each aggregate it sees through the projection: the
+  load writes the row, so the table knows it before the saga handles a later event.
+- **A page that loads through a remote client** (a `Sidecar`): once connected, a call
+  made while the connection is down waits for it to come back, up to
+  `request_timeout` (30 s). Check `client.state()` first and show the row while it
+  is not `Connected`, with a short timeout on the load.
 
 ### Commands and the write gateway (`#[evento::command]`)
 
